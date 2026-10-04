@@ -37,17 +37,28 @@ export function publishReadiness(ctx, env = process.env) {
   publish()
   const timer = setInterval(publish, 2000)
   timer.unref()
-  // Awaiting inside apply would deadlock Loader settlement on our own mount.
-  void (async () => {
-    try {
-      await ctx.get('loader')?.await()
-      if (disposed) return
-      state = 'ready'
-      publish()
-    } catch { /* Failed startup must never publish ready. */ }
-  })()
+  const markReady = () => {
+    if (disposed) return
+    state = 'ready'
+    publish()
+  }
+  const appReady = ctx.get('appReady')
+  let cancelReady = () => {}
+  if (typeof appReady?.onReady === 'function') {
+    cancelReady = appReady.onReady(markReady)
+  } else {
+    // Older dsh has no launcher signal. Awaiting inside apply would deadlock
+    // Loader settlement on our own mount, so keep this fallback asynchronous.
+    void (async () => {
+      try {
+        await ctx.get('loader')?.await()
+        markReady()
+      } catch { /* Failed startup must never publish ready. */ }
+    })()
+  }
   return () => {
     disposed = true
+    cancelReady()
     clearInterval(timer)
     try {
       const current = JSON.parse(fs.readFileSync(file, 'utf8'))

@@ -7,8 +7,12 @@ Windows 上也能优雅停止（否则只能 `taskkill` 硬杀）。
 
 ## 功能
 
+0.4.1 兼容 dsh 0.2.x：新版优先等待 launcher 的 `appReady.onReady()` 正式就绪
+信号，旧版保留 Loader 回退。默认最新版 `0.2.0-rc.2` 使用独立 profile 验证；
+`0.2.1-alpha.1` 已核对相关源码接口，运行验收情况见项目兼容台账 §2.1.2。
+
 0.4.0 起，Whalekeeper 启动的实例会主动报告就绪状态与实际端口。插件先等待 dsh
-加载完成，再写入宿主指定的 `ready/dsh-web.json`；每 2 秒更新，正常卸载时删除。
+成功启动，再写入宿主指定的 `ready/dsh-web.json`；每 2 秒更新，正常卸载时删除。
 文件仅含启动标识、PID、端口、时间和版本，不含消息或认证 token。手工启动未提供
 宿主环境变量时不创建文件；旧宿主照常使用 HTTP 端点。协议见[宿主设计](../../docs/design/02-native-host.md) §6.9。
 
@@ -17,7 +21,7 @@ Windows 上也能优雅停止（否则只能 `taskkill` 硬杀）。
 
 | 方法 | 路径 | 响应 | 语义 |
 |------|------|------|------|
-| `POST` | `/_lifecycle/shutdown` | `202 {"ok":true}`（重复请求 `409`） | 先刷出响应，再 `appExit(0)`：优雅 dispose 请求（触发 dsh 官方 fiber dispose，端口随之关闭）；进程退出依赖事件循环自然排空，**不保证必然退出**；DSH Manager 宿主以端口关闭为判定权威，必要时 taskkill 回退 |
+| `POST` | `/_lifecycle/shutdown` | `202 {"ok":true}`（重复请求 `409`） | 先刷出响应，再 `appExit(0)`：触发 dsh 官方 fiber dispose；宿主等待端口和 PID 退出，排空超时复核 PID 后强制清理 |
 | `GET`  | `/_lifecycle/health`    | `200` JSON | 健康/富状态（下见示例） |
 | `GET`  | `/_manager/sessions`    | `200 {"ok":true,"items":[...]}` | **只读会话摘要**（M9）：live 会话的元数据行——`sessionId/title?/state/updatedAt/blank/cwd?`；**不读消息体/事件内容/凭据** |
 | `GET`  | `/_manager/events`      | `200 text/event-stream` | **SSE 会话推送**（M12，零依赖）：连接即 `snapshot`（与 sessions 完全同构，同 `buildItems` 单一派生面）；之后仅语义变化推 `upsert`/`removed` 增量（15s 心跳 `: ping` + `retry: 3000`；重连=重拿快照，无 Last-Event-ID 回放）。驱动源 = Cordis 事件总线（`session/event`/`session/created`/`session/disposed`/`agent/status`，app 级订阅接收全部会话事件——官方 apiproxy 同款模式），**事件内容绝不进入推送面，只出摘要** |
@@ -175,7 +179,7 @@ HTTP」链路（宿主请求不带 Origin）天然合规。`shutdown` 仅 `POST`
 ## 与浏览器扩展的关系（DSH Manager）
 
 - **双层正交、双向可选**：装了插件 → 宿主 stop 先 `POST /_lifecycle/shutdown` 优雅停（3s 内
-  端口关闭；`appExit` 不保证进程退出，端口未关或进程残留时宿主 taskkill 回退）；没装插件 →
+  端口关闭后继续等 PID 退出，10s 未排空时复核身份并 taskkill 回退）；没装插件 →
   宿主自动降级 `taskkill /T /F`，状态用端口探活，功能不受影响。
 - 插件不自己 respawn：进程内拿不到启动参数，重启编排权在宿主（持有 run 记录的 `cmdline`）。
 
@@ -187,5 +191,5 @@ node --test test/
 ```
 
 零运行时依赖（只依赖 dsh 注入的 `webServer` / `appExit` 服务）；`package.json` 以
-`peerDependencies: { "@deepseek-ai/dsh": ">=0.1.0-rc.6 <0.2.0" }` 声明与 dsh 的兼容范围
-（仅语义声明，不随包安装依赖）。
+`peerDependencies: { "@deepseek-ai/dsh": ">=0.1.0-rc.6 <0.3.0-0" }` 声明与 dsh 的兼容范围。
+dsh 0.2.x 会使用 `includePrerelease: true` 强制校验此范围；无需设置版本豁免。

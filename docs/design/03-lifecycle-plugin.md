@@ -35,7 +35,7 @@ health 响应（v1 最小集；v2 扩展会话/作业等聚合字段）：
 
 ### 7.3 实现要点（基于 F12 核验的源码契约）
 
-1. **注入**：`inject: ['webServer', 'appExit']`——`webServer` 提供 `register({kind:'exact', path, handler})` 并返回 disposer；`appExit` 是 dsh-cmdline 提供的官方退出出口（= launcher 的 `shutdown` → `fiber.dispose()`），它**只是优雅 dispose 请求**——dispose 成功后仅设 `process.exitCode`，**不强制 `process.exit()`**，进程退出依赖事件循环自然排空；宿主以端口关闭为权威判定（§6.3 stop），并有 taskkill 回退。
+1. **注入**：`inject: ['webServer', 'appExit']`——`webServer` 提供 `register({kind:'exact', path, handler})` 并返回 disposer；`appExit` 是 dsh-cmdline 提供的官方退出出口（= launcher 的 `shutdown` → `fiber.dispose()`）。新版 launcher 给 dispose 5 秒宽限，正常完成后设置 `process.exitCode`；宿主等待端口关闭和 PID 退出（§6.3 stop），排空超时则复核 PID 后 taskkill 回退。
 2. **响应先于退出**：shutdown 处理器在 `res.end()` 完成回调后 `setImmediate(() => ctx.appExit(0))`，确保 202 刷出到 socket 再开始 dispose（避免响应被截断）。
 3. **安全围栏（自管）**：插件路由不经过 `/api` 网关围栏（F9/F12），必须自行校验：
    - `req.socket.remoteAddress` 必须为回环地址；
@@ -89,7 +89,7 @@ export function apply(ctx) {
 
 ### 7.4 与宿主的协作分工（M2）
 
-- **stop**：宿主先 POST `/_lifecycle/shutdown` → 轮询端口关闭 ≤ 10s → 超时回退 taskkill。
+- **stop**：宿主先 POST `/_lifecycle/shutdown` → 端口关闭后继续等 PID 退出 ≤ 10s → 超时复核 PID 后回退 taskkill。
 - **restart**：shutdown → 等 stopped → 用 run 记录的 `cmdline` 原样重放 spawn。插件**不自行 respawn**：插件进程内拿不到 profile 名（`cmdlineArgs` 只含 launcher 之后的内部参数，F12），而宿主恰好持有权威启动命令，职责归属清晰。
 - **status**：存活判定仍以「PID 存活 + 端口探活」为权威（插件缺失不能把 running 误判为 stopped）；`health` 仅作富状态补充（§4.2.6）。
 

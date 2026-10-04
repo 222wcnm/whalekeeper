@@ -34,7 +34,7 @@ test('readiness waits for Loader, reports actual process/port, and cleans up', a
   assert.equal(signal.launchId, f.env.DSH_MANAGER_LAUNCH_ID)
   assert.equal(signal.launchStartedAt, Number(f.env.DSH_MANAGER_LAUNCH_STARTED_AT))
   assert.equal(signal.schemaVersion, 1)
-  assert.equal(signal.pluginVersion, '0.4.0')
+  assert.equal(signal.pluginVersion, '0.4.1')
   assert.equal(JSON.stringify(signal).includes('token'), false)
   dispose()
   assert.equal(fs.existsSync(f.file), false)
@@ -46,6 +46,44 @@ test('dispose before Loader settlement cannot republish', async (t) => {
   f.start()()
   settle()
   await new Promise(setImmediate)
+  assert.equal(fs.existsSync(f.file), false)
+})
+
+test('appReady takes precedence over Loader settlement', async (t) => {
+  const f = fixture(t, { await: async () => {} })
+  let ready
+  f.ctx.get = name => name === 'appReady'
+    ? { onReady(callback) { ready = callback; return () => { ready = undefined } } }
+    : { await: async () => {} }
+  f.start()
+  await new Promise(setImmediate)
+  assert.equal(f.read().state, 'starting')
+  assert.equal(typeof ready, 'function')
+  ready()
+  assert.equal(f.read().state, 'ready')
+})
+
+test('failed startup without appReady commit remains starting', async (t) => {
+  const f = fixture(t)
+  f.ctx.get = name => name === 'appReady'
+    ? { onReady() { return () => {} } }
+    : { await: async () => {} }
+  f.start()
+  await new Promise(setImmediate)
+  assert.equal(f.read().state, 'starting')
+})
+
+test('dispose cancels appReady and a late callback cannot republish', (t) => {
+  const f = fixture(t)
+  let ready
+  let cancelled = false
+  f.ctx.get = () => ({ onReady(callback) {
+    ready = callback
+    return () => { cancelled = true }
+  } })
+  f.start()()
+  assert.equal(cancelled, true)
+  ready()
   assert.equal(fs.existsSync(f.file), false)
 })
 

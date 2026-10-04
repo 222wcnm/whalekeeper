@@ -104,8 +104,9 @@
 
 **status**
 
-M13 二期优先规则：步骤 2/3 通过后先检查 §6.9 就绪文件；有效 ready 直接返回 running
-与文件内 health，starting 返回 starting；只有无有效文件时才执行下面的 HTTP 回退。
+M13 二期优先规则：有效就绪文件（§6.9）直接返回 running 与文件内 health，starting
+返回 starting；无有效文件时执行下面的 HTTP 回退。只读 status 对新鲜、身份匹配的就绪
+文件跳过 Windows 进程命令查询；停止、重启等管理动作仍执行 PID 复用校验。
 
 1. 读 `run\dsh-web.json`；不存在 → 执行外部实例发现（§6.6）：发现则返回 `external`（附 `source:"external"`、真实 pid/port/url 与 `externalCount`），否则 `stopped`（顺带清理孤儿 pid 文件）。
 2. `process.kill(pid, 0)` 判定存活；已死 → 清理记录 → 同第 1 步执行外部实例发现。
@@ -145,7 +146,7 @@ M13 二期优先规则：步骤 2/3 通过后先检查 §6.9 就绪文件；有�
 2. 抢锁。
 3. 优雅路径（dsh-lifecycle 插件存在时）：先探测 `/_lifecycle/health`（1.5s）判定插件可用；可用则 `POST http://127.0.0.1:<port>/_lifecycle/shutdown`（2s 连接超时）→ 轮询端口关闭 ≤ 3s；关闭则记为 `stopMethod:'graceful'` 并跳过第 4 步。插件不可达则直接走第 4 步（不浪费一次 POST；SPA fallback 对未匹配路径也返回 200，不能以状态码判定插件存在）。
 4. 强制路径（插件缺失或优雅路径超时）：Windows 为 `taskkill /PID <pid> /T /F`；**M4 POSIX 为 SIGTERM（进程组，detached 起组）→ 3s 内未退出 SIGKILL 兜底**；均记为 `stopMethod:'force'`（语义不变：优雅仅指 lifecycle 插件路径）。PID 取自 run 记录；先做 PID 复用校验，失败则拒杀并报 `STOP_FAILED`。
-5. 轮询端口关闭 ≤ 10s；仍未关闭 → `STOP_FAILED`。
+5. 等待端口关闭且 PID 退出 ≤ 10s；PID 仍活着则复核身份并强制终止，标记 `stopMethod:'force'`，再等 ≤ 3s；仍未完全退出 → `STOP_FAILED`。
 6. 删除 run 记录与 pid 文件，释放锁。stop 响应的 result 附带 `stopMethod`（graceful/force）。
 
 **restart**
@@ -186,7 +187,7 @@ M13 二期优先规则：步骤 2/3 通过后先检查 §6.9 就绪文件；有�
    - 以 `process.execPath` (Node) 运行对应 `lib/bin.js`。若均找不到，报 `DSH_NOT_FOUND`，引导用户执行 `npm i -g @deepseek-ai/dsh` 或切换为 NPX 免安装模式。
 2. **`npx` 免安装快速启动模式**：
    - 官方最新推文推荐模式：使用系统 `npx`（Windows 下优先探测 `npx.cmd`，POSIX `npx`）。
-   - 命令行：`npx -y @deepseek-ai/dsh web --profile <profile> --host 127.0.0.1 --port <port> [extraArgs...]`（必须显式携带 `-y` 防止首次无缓存时触发交互确认挂死）。
+   - 命令行：`npx -y @deepseek-ai/dsh --profile <profile> [extraArgs...] --host 127.0.0.1 --port <port>`（必须显式携带 `-y` 防止首次无缓存时触发交互确认挂死）。profile 只选择一次；`extraArgs` 中的 launcher `--patch` 必须在 Web 参数前（§2.1.2）。global / source 同样遵守此顺序。
 3. **`source` 本地源码 / 脚本路径模式**：
    - 针对开发者本地 `git clone` 场景：解析 `customPath`，若为文件直接使用；若为目录，自动探测其下的 `lib/bin.js`、`bin.js`、`packages/cli/lib/bin.js` 等入口。
    - 校验文件存在后以 `process.execPath` 直接执行，启动本地最新源码。源码仓库须先按上游 README 执行 `pnpm install`、`pnpm run build`；只有入口文件存在不足以证明其 workspace 依赖和 `lib/` 产物齐全。
@@ -280,6 +281,11 @@ run 记录示例：
 
 ## 6.9 插件就绪文件（M13 二期，2026-09-21）
 
+**0.2.x 退出补充（2026-10-04）**：shutdown 的端口关闭表示 dispose 已开始；stop
+还需等记录中的 PID 退出后才能清记录和重启。10 秒内未退出时复核 PID 身份并强制
+终止，`stopMethod` 据实际路径返回 graceful / force。这样 Windows 的旧日志句柄
+不会阻止新载体打开日志文件；见 §2.1.2 与 `native-host/test/stop.test.js`。
+
 宿主每次 start/restart 生成随机 128-bit `launchId` 与 `launchStartedAt`，经子进程环境
 `DSH_MANAGER_READY_FILE`、`DSH_MANAGER_LAUNCH_ID`、`DSH_MANAGER_LAUNCH_STARTED_AT`
 传递。路径固定为宿主 `BASE_DIR/ready/dsh-web.json`，独立于宿主拥有的 run 记录；扩展
@@ -288,12 +294,16 @@ run 记录示例：
 文件 v1：`{schemaVersion:1, launchId, launchStartedAt, mountId, pid, host:'127.0.0.1', port,
 state:'starting'|'ready', startedAt, updatedAt, pluginVersion, nodeVersion}`。`startedAt`
 是插件估算的进程启动时间，`launchStartedAt` 原样回传宿主启动时间。插件先发布 starting，
-异步等待 `ctx.get('loader')?.await()`（不可阻塞 apply）后发布 ready；port 必须是
+优先订阅 `ctx.get('appReady').onReady()`，仅在 launcher 确认成功启动后发布 ready；
+旧版无该服务时异步等待 `ctx.get('loader')?.await()`（不可阻塞 apply）。dispose
+取消未触发的就绪订阅，失败启动不得发布 ready；port 必须是
 `webServer.port` 的实际非零端口。相邻临时文件 + rename 原子替换，每 2 秒续期，计时器
 unref；清理器仅删除自身 mount 写出的文件，dispose 后不得再次发布。写失败不影响 dsh。
 
-宿主只接受 ≤8 KiB、结构合法、启动标识与启动时间匹配、PID 存活且符合既有进程校验、
+宿主只接受 ≤8 KiB、结构合法、启动标识与启动时间匹配、PID 存活、
 固定端口匹配（动态端口可回填）、updatedAt 在过去 10 秒内（未来容差 2 秒）的记录。
+只读 status 在这些条件成立时跳过耗时的进程命令查询；start/stop/restart 等管理路径
+继续执行既有进程校验，且在已验证同一 PID 后不重复查询。
 run 记录保存 launchId/launchStartedAt 供后续独立 native 调用复核，不保存任意就绪路径。
 ready 优先于 HTTP；starting 不被 HTTP 成功覆盖。缺失、过期、损坏或不匹配时走原 HTTP
 回退，**文件消失不等于 stopped**（插件热卸载、写失败、旧插件均可能无文件）。PID 死亡
@@ -302,4 +312,4 @@ ready 优先于 HTTP；starting 不被 HTTP 成功覆盖。缺失、过期、损
 start 在启动前监听 ready 目录，用文件变化唤醒等待，同时保留 500ms 定时检查应对丢事件；
 有效信号直接提供 PID/动态端口，省去 HTTP 与 Windows 端口表反查。启动 URL 仍按 §12.3
 从日志捕获，文件不含认证 token。status 有新鲜 ready 时直接构造 health，不发 HTTP；
-stop 的端口关闭与优雅退出验证保持原语义。扩展请求/响应格式不变（§6.2）。
+stop 先判断端口关闭，再等待 PID 退出（见本节 0.2.x 补充）。扩展请求/响应格式不变（§6.2）。

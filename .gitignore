@@ -15,6 +15,7 @@ tools/verify-ui/shots/*
 .smoke/
 .smoke-real/
 .e2e-m9/
+.e2e-current/
 .review/
 
 # ---- UI 主题探索/截图产物（生成物，非源；预览 HTML 与提取脚本仍入库）----

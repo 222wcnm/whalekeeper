@@ -1369,6 +1369,38 @@ async function scenarioSourceOverlay() {
   expect(stop?.ok && stop.result.state === 'stopped', '31 source 模式可停止');
 }
 
+// Exercise actual launch-spec resolution, including the NPX branch (no stub).
+async function scenarioCurrentCli() {
+  fs.mkdirSync(TMP, { recursive: true });
+  const patch = path.join(TMP, 'launcher.patch.yml');
+  fs.writeFileSync(patch, '[]\n');
+  const argsFile = path.join(TMP, 'launcher-args.json');
+  const shim = path.join(TMP, 'npx-shim.js');
+  fs.writeFileSync(shim, `process.argv = [process.execPath, ${JSON.stringify(FAKE_DSH)}, ...process.argv.slice(4)];\nrequire(${JSON.stringify(FAKE_DSH)});\n`);
+  const npx = path.join(TMP, IS_WIN ? 'npx.cmd' : 'npx');
+  const quote = value => "'" + value.replace(/'/g, "'\\''") + "'";
+  fs.writeFileSync(npx, IS_WIN
+    ? `@echo off\r\n"${process.execPath}" "${shim}" %*\r\n`
+    : `#!/bin/sh\nexec ${quote(process.execPath)} ${quote(shim)} "$@"\n`, { mode: 0o755 });
+  const pathKey = Object.keys(process.env).find(key => key.toLowerCase() === 'path') || 'PATH';
+  for (const mode of ['npx', 'global', 'source']) {
+    const env = { DSH_FAKE_STRICT_CLI: '1', DSH_FAKE_ARGS_FILE: argsFile,
+      [pathKey]: TMP + path.delimiter + (process.env[pathKey] || ''),
+      ...(mode !== 'global' ? { DSH_BIN_STUB: '' } : {}) };
+    const start = runHost({ id: 'cli-start', action: 'start', payload: {
+      launchMode: mode, customPath: mode === 'source' ? FAKE_DSH : '',
+      port: 31932, extraArgs: ['--patch', patch],
+    } }, 'cli-start', env);
+    expect(start?.ok && start.result.state === 'running', '32 ' + mode + ' accepts current CLI arguments',
+      start?.error && start.error.message);
+    const argv = JSON.parse(fs.readFileSync(argsFile, 'utf8'));
+    expect(argv[0] === '--profile' && argv[1] === 'web', '32 ' + mode + ' selects profile once');
+    expect(argv.indexOf(patch) < argv.indexOf('--host'), '32 ' + mode + ' patch precedes Web arguments');
+    const stop = runHost({ id: 'cli-stop', action: 'stop' }, 'cli-stop', env);
+    expect(stop?.ok && stop.result.stopMethod === 'graceful', '32 ' + mode + ' stops gracefully');
+  }
+}
+
 // 主流程
 // ---------------------------------------------------------------------------
 async function main() {
@@ -1431,6 +1463,8 @@ async function main() {
   try { await scenarioReadiness(); } catch (e) { record('readiness', '场景 30 异常', false, e.message); }
   cleanup();
   try { await scenarioSourceOverlay(); } catch (e) { record('source', '场景 31 异常', false, e.message); }
+  cleanup();
+  try { await scenarioCurrentCli(); } catch (e) { record('cli', '场景 32 异常', false, e.message); }
   cleanup();
 
   const failed = results.filter((r) => !r.ok);

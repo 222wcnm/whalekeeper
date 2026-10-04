@@ -111,7 +111,7 @@ const READY_DIR = path.join(BASE_DIR, 'ready');
 const READY_FILE = path.join(READY_DIR, 'dsh-web.json');
 
 // Plugin-owned readiness lease (design §6.9); never accept a path from a request/run record.
-function readReadiness(expected) {
+function readReadiness(expected, skipPidCommandCheck = false) {
   if (!expected || !/^[a-f0-9]{32}$/.test(expected.launchId || '')
     || !Number.isSafeInteger(expected.launchStartedAt)) return null;
   try {
@@ -129,7 +129,8 @@ function readReadiness(expected) {
       || !Number.isSafeInteger(signal.updatedAt) || signal.updatedAt < expected.launchStartedAt
       || now - signal.updatedAt > 10000 || signal.updatedAt > now + 2000
       || typeof signal.pluginVersion !== 'string' || typeof signal.nodeVersion !== 'string'
-      || !pidAlive(signal.pid) || !pidLooksLikeDsh(signal.pid, expected.binPath)) return null;
+      || !pidAlive(signal.pid)
+      || (!skipPidCommandCheck && !pidLooksLikeDsh(signal.pid, expected.binPath))) return null;
     return signal;
   } catch (_) { return null; }
 }
@@ -622,13 +623,12 @@ async function waitPortClosed(port, totalMs, intervalMs) {
 async function waitProcessStopped(pid, port, totalMs, intervalMs) {
   const deadline = Date.now() + totalMs;
   for (;;) {
-    if (!pidAlive(pid)) return true;
-    if (!(await portConnectable(port, 800))) return true;
+    if (!pidAlive(pid) && !(await portConnectable(port, 800))) return true;
     const remaining = deadline - Date.now();
     if (remaining <= 0) break;
     await sleep(Math.min(intervalMs, remaining));
   }
-  return !pidAlive(pid) || !(await portConnectable(port, 800));
+  return !pidAlive(pid) && !(await portConnectable(port, 800));
 }
 
 // ---------------------------------------------------------------------------
@@ -1118,7 +1118,7 @@ function getDshVersion(bin) {
 // ---------------------------------------------------------------------------
 // 进程启动与终止
 // ---------------------------------------------------------------------------
-// spawn：node.exe <bin.js> --profile <p> --host <h> --port <n> [extraArgs...]
+// spawn：node.exe <bin.js> --profile <p> [extraArgs...] --host <h> --port <n>
 // POSIX：直接 spawn（无控制台概念），stdout/stderr 追加写日志文件；透传全部环境变量。
 // Windows（M5.5）：隐藏控制台载体（design §6.3 第 5 步）——wscript.exe 执行
 // launch-hidden.vbs，WScript.Shell.Run(cmd, 0, False) 以 SW_HIDE 创建控制台：
@@ -1170,7 +1170,7 @@ function resolveLaunchSpec(v) {
     const bin = process.env.DSH_BIN_STUB;
     return {
       exe: process.execPath,
-      args: [bin, '--profile', v.profile, '--host', v.host, '--port', String(v.port), ...v.extraArgs],
+      args: [bin, '--profile', v.profile, ...v.extraArgs, '--host', v.host, '--port', String(v.port)],
       binPath: bin,
       version: getDshVersion(bin),
       launchMode: mode,
@@ -1198,7 +1198,7 @@ function resolveLaunchSpec(v) {
     const pkg = '@deepseek-ai/dsh';
     return {
       exe: npxExe,
-      args: ['-y', pkg, 'web', '--profile', v.profile, '--host', v.host, '--port', String(v.port), ...v.extraArgs],
+      args: ['-y', pkg, '--profile', v.profile, ...v.extraArgs, '--host', v.host, '--port', String(v.port)],
       binPath: 'npx:' + pkg,
       version: 'npx',
       launchMode: mode,
@@ -1256,7 +1256,7 @@ function resolveLaunchSpec(v) {
     return {
       exe: process.execPath,
       args: [targetBin, '--profile', v.profile, '--patch', sourceProfileOverlay(),
-        '--host', v.host, '--port', String(v.port), ...v.extraArgs],
+        ...v.extraArgs, '--host', v.host, '--port', String(v.port)],
       binPath: targetBin,
       version: getDshVersion(targetBin),
       launchMode: mode,
@@ -1271,7 +1271,7 @@ function resolveLaunchSpec(v) {
   }
   return {
     exe: process.execPath,
-    args: [bin, '--profile', v.profile, '--host', v.host, '--port', String(v.port), ...v.extraArgs],
+    args: [bin, '--profile', v.profile, ...v.extraArgs, '--host', v.host, '--port', String(v.port)],
     binPath: bin,
     version: getDshVersion(bin),
     launchMode: 'global',
@@ -1284,7 +1284,7 @@ function spawnDsh(specOrBin, v) {
     ? specOrBin
     : {
       exe: process.execPath,
-      args: [specOrBin, '--profile', v.profile, '--host', v.host, '--port', String(v.port), ...v.extraArgs],
+      args: [specOrBin, '--profile', v.profile, ...v.extraArgs, '--host', v.host, '--port', String(v.port)],
     };
   if (IS_WIN) return spawnDshWinCarrier(spec, v);
   fs.mkdirSync(LOGS_DIR, { recursive: true });
@@ -1307,7 +1307,7 @@ function spawnDshWinCarrier(specOrBin, v) {
     ? specOrBin
     : {
       exe: process.execPath,
-      args: [specOrBin, '--profile', v.profile, '--host', v.host, '--port', String(v.port), ...v.extraArgs],
+      args: [specOrBin, '--profile', v.profile, ...v.extraArgs, '--host', v.host, '--port', String(v.port)],
     };
   fs.mkdirSync(BASE_DIR, { recursive: true });
   fs.mkdirSync(LOGS_DIR, { recursive: true }); // cmd 重定向目标目录必须先存在
@@ -1612,18 +1612,26 @@ function validateStartPayload(payload) {
 // ---------------------------------------------------------------------------
 // 状态判定（design §5 / §6.3 status / §6.6 外部实例发现）
 // ---------------------------------------------------------------------------
-async function computeStatus() {
+async function computeStatus(fastReadiness = false) {
   const rec = readRunRecord();
   let readiness;
   if (rec) {
     if (!pidAlive(rec.pid)) {
       log('run 记录指向的 PID 不存在，清理残留记录');
       removeRunRecordSafe();
+    } else if (fastReadiness && (readiness = readReadiness(rec, true))) {
+      // 只读 status：新鲜租约已绑定本次启动的 ID、PID 与端口，无须每轮启动 tasklist。
+      if (rec.port === 0) {
+        rec.port = readiness.port;
+        rec.launchUrl = discoverLaunchUrlFromLog(rec.logStartBytes);
+        writeRunRecord(rec);
+      }
+      return { state: readiness.state === 'ready' ? 'running' : 'starting', rec, readiness };
     } else if (!pidLooksLikeDsh(rec.pid, rec.binPath)) {
       // 可选 PID 校验：命令行不含 dsh/bin 关键字，疑似 PID 复用，清记录防误判
       log('PID 校验未通过（疑似 PID 复用），清理残留记录');
       removeRunRecordSafe();
-    } else if ((readiness = readReadiness(rec))) {
+    } else if ((readiness = readReadiness(rec, true))) {
       if (rec.port === 0) {
         rec.port = readiness.port;
         rec.launchUrl = discoverLaunchUrlFromLog(rec.logStartBytes);
@@ -1707,7 +1715,7 @@ async function actionPing() {
 }
 
 async function actionStatus() {
-  const { state, rec, external, readiness } = await computeStatus();
+  const { state, rec, external, readiness } = await computeStatus(true);
   const result = buildResult(state, rec, external);
   if (state === 'running' && readiness) {
     result.lifecycle = true;
@@ -1995,10 +2003,22 @@ async function stopCore(rec) {
         throw new AppError('STOP_FAILED', '强制终止执行失败: ' + (k.error || ('退出码 ' + k.code)), { needLogTail: true });
       }
     }
-    // 5. 轮询端口关闭最长 10s；仍未关 -> STOP_FAILED + logTail
-    const closed2 = await waitProcessStopped(rec2.pid, rec2.port, 10000, 300);
-    if (!closed2) {
-      throw new AppError('STOP_FAILED', `端口 ${rec2.port} 在 10 秒内未关闭`, { needLogTail: true });
+    // 5. 等待端口和 PID 都退出。新 dsh 的端口先于进程关闭；Windows 下
+    //    旧进程持有日志句柄时立即重启会使 cmd 重定向失败，不能只等端口。
+    let stopped = await waitProcessStopped(rec2.pid, rec2.port, 10000, 300);
+    if (!stopped && pidAlive(rec2.pid)) {
+      if (!pidLooksLikeDsh(rec2.pid, rec2.binPath)) {
+        throw new AppError('STOP_FAILED', `PID ${rec2.pid} 已不属于 dsh，拒绝强制终止`, { needLogTail: true });
+      }
+      const k = await terminateProcess(rec2.pid);
+      if (!k.ok && pidAlive(rec2.pid)) {
+        throw new AppError('STOP_FAILED', '退出清理失败: ' + (k.error || ('退出码 ' + k.code)), { needLogTail: true });
+      }
+      method = 'force';
+      stopped = await waitProcessStopped(rec2.pid, rec2.port, 3000, 200);
+    }
+    if (!stopped) {
+      throw new AppError('STOP_FAILED', `dsh 进程 ${rec2.pid} 或端口 ${rec2.port} 未退出`, { needLogTail: true });
     }
     // 6. 成功：删除 run 记录与 pid 文件
     removeRunRecord();

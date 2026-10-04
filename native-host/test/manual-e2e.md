@@ -300,6 +300,20 @@ Get-Content "$env:USERPROFILE\.dsh\profiles\web\package.json"
 
 ## 验收汇总表
 
+### dsh 0.2.x 补充（2026-10-04）
+
+- `node native-host/test/e2e-current-isolated.js` 默认使用 `%APPDATA%\npm` 的 CLI，
+  可用 `DSH_MANAGER_NPM_PREFIX` 指向其他安装。它通过官方 plugin CLI 安装本地包，
+  在 `.e2e-current/<唯一 ID>/` 隔离 profile 和宿主记录，不读写日常 profile。
+- 覆盖版本检查、固定/动态端口、启动令牌兑换 cookie、健康与会话摘要、真实 Session
+  事件触发 SSE 的 waiting/completed、重启和优雅退出；测试不调用模型。
+- `$env:DSH_MANAGER_VERIFY_UI='1'` 时同时运行现有 headless 浏览器验收，认证从隔离
+  run 记录读取，产物保存到同一测试目录的 `ui.log` 与 `tools/verify-ui/shots/`。
+- `node --test native-host/test/stop.test.js` 检查端口先关、PID 延迟退出时的停止、
+  重启和超时强制清理；宿主 smoke 场景 32 检查 global / NPX / source 的新版 CLI。
+- 实际使用前更新完整 `dsh-lifecycle` 0.4.1；重启时先等旧 PID 退出，避免 Windows
+  日志句柄占用。安装器注册信息与浏览器权限未改，无需重新注册宿主。
+
 ### M13 二期补充（2026-09-21）
 
 - 先跑 `node --test native-host/test/readiness.test.js` 和插件 `test/*.test.js`，再跑

@@ -12,11 +12,11 @@ const now = Date.now();
 const expected = { launchId: 'a'.repeat(32), launchStartedAt: now - 1000, pid: 42, port: 3080 };
 const valid = { ...expected, schemaVersion: 1, host: '127.0.0.1', state: 'ready',
   startedAt: now - 2000, updatedAt: now, pluginVersion: '0.4.0', nodeVersion: 'v22.0.0' };
-function parse(signal, overrides = {}, want = expected) {
+function parse(signal, overrides = {}, want = expected, skipPidCommandCheck = false) {
   const context = { DEFAULT_HOST: '127.0.0.1', READY_FILE: 'owned-path',
     fs: { statSync: () => ({ size: 256 }), readFileSync: () => JSON.stringify(signal) },
     pidAlive: () => true, pidLooksLikeDsh: () => true, ...overrides };
-  return vm.runInNewContext(parser + '\nreadReadiness', context)(want);
+  return vm.runInNewContext(parser + '\nreadReadiness', context)(want, skipPidCommandCheck);
 }
 test('valid ready and starting leases, including dynamic port discovery', () => {
   assert.equal(parse(valid).state, 'ready');
@@ -39,4 +39,12 @@ test('missing, oversized and invalid JSON files fall back without throwing', () 
     { statSync: () => ({ size: 8193 }) },
     { statSync: () => ({ size: 3 }), readFileSync: () => '{' },
   ]) assert.equal(parse(valid, { fs: fileSystem }), null);
+});
+
+test('read-only fast path skips process command lookup but still validates lease and live PID', () => {
+  const noCommandLookup = () => { throw new Error('unexpected command lookup'); };
+  assert.equal(parse(valid, { pidLooksLikeDsh: noCommandLookup }, expected, true).state, 'ready');
+  assert.equal(parse(valid, { pidAlive: () => false, pidLooksLikeDsh: noCommandLookup }, expected, true), null);
+  assert.equal(parse({ ...valid, launchId: 'b'.repeat(32) },
+    { pidLooksLikeDsh: noCommandLookup }, expected, true), null);
 });

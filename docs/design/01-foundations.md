@@ -166,6 +166,27 @@ DeepSeek Harness（以下简称 dsh，npm 包 `@deepseek-ai/dsh`）的 Web 界�
 
 ---
 
+### 2.1.2 `0.1.x` → `0.2.0-rc.2` / `0.2.1-alpha.1`（2026-10-04）
+
+npm 实测 `latest` / `next` = `0.2.0-rc.2`，`alpha` = `0.2.1-alpha.1`；本机全局与
+源码 checkout 均为 `0.2.0-rc.2`。默认最新版作为真实隔离验收基线，alpha 按官方
+`dsh-v0.2.1-alpha.1` tag 对照相关接缝，不把源码核对当成运行验收。
+
+| 接缝 | 变化与兼容措施 |
+|---|---|
+| 插件版本检查 | 新版 app-boot 会强制校验 dsh peerDependencies（`includePrerelease: true`）；旧 `<0.2.0-0` 会拒绝加载。插件范围改为 `>=0.1.0-rc.6 <0.3.0-0`，保留 0.1.x 并覆盖已核对的 0.2.x；不使用版本豁免。历史 R2 中预发布版的标准 semver 结论不代表新版 dsh 的校验行为。 |
+| CLI profile | 新版只允许选择一次 profile；NPX 原来的 `web --profile web` 已真实复现参数错误。统一使用 `--profile <profile>`。 |
+| CLI patch | launcher 在第一个 app 参数处停止解析；`--patch` 必须位于 `--host` / `--port` 之前。global / NPX / source 同步调整，接管的原始 argv 重放不变。 |
+| 正式启动就绪 | 新版 cmdline 提供 `appReady.onReady()`，仅在启动成功后调用。就绪文件优先订阅该信号；旧版缺少服务时继续异步等待 Loader，dispose 取消订阅。 |
+| 退出与重启 | 新版 launcher 的 dispose 最长有 5 秒退出宽限；端口可能先关闭。Windows 真实 restart 已出现启动超时，延迟退出测试确认旧宿主会在 PID 仍存活时返回 stopped。停止须等 PID 与端口都退出，10 秒未排空则复核 PID 后强制终止，避免旧日志句柄阻止下一次启动。 |
+| 会话与事件 | `snapshotEvents()`、`sessions.get/list`、`agents.get(id).status`、`workspaceRegistry.archivedSessionIds`、session / agent / subagent 事件形状保留；app 层未标记作用域的监听者仍接收全部会话事件。 |
+| HTTP 与界面 | `webServer.register/port`、`appExit`、启动令牌 URL、公开 manifest、`data-state` 与深色主题属性保留。alpha 移除 invariant 导出，本插件没有此依赖；新增 `publicUrl` 不改变默认回环入口，远程代理入口不在 Whalekeeper 当前范围。 |
+
+验收覆盖：新版真实 CLI 解析与版本检查、隔离 profile 的固定/动态端口、启动令牌认证、
+就绪文件、健康与会话摘要、真实 SSE 状态推送、重启与优雅退出；宿主冒烟回归旧版行为。
+
+---
+
 ## 3. 方案选型
 
 ### 3.1 为什么必须用 Native Messaging

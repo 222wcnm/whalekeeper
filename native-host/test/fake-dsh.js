@@ -35,6 +35,20 @@
 // ============================================================================
 
 const http = require('http');
+let listeningServer;
+
+// Match the current launcher's profile/patch boundary for compatibility smoke.
+if (process.env.DSH_FAKE_STRICT_CLI === '1' && !process.argv.includes('--version')) {
+  const argv = process.argv.slice(2);
+  if (argv.filter(a => a === '--profile').length !== 1 || argv.includes('web') && argv[0] === 'web'
+    || argv.some((a, i) => a === '--patch' && i > argv.indexOf('--host'))) {
+    console.error('Invalid launcher arguments: profile must be selected once and patches precede app flags');
+    process.exit(1);
+  }
+  if (process.env.DSH_FAKE_ARGS_FILE) {
+    require('fs').writeFileSync(process.env.DSH_FAKE_ARGS_FILE, JSON.stringify(argv));
+  }
+}
 
 function arg(name, def) {
   const argv = process.argv.slice(2);
@@ -98,6 +112,7 @@ if (port === 0 && !exitImmediately) {
   const server = http.createServer((req, res) => {
     respond(server.address().port, req, res);
   });
+  listeningServer = server;
   server.listen(0, '127.0.0.1', () => {
     const actual = server.address().port;
     void publishReady(actual);
@@ -121,6 +136,7 @@ if (exitImmediately) {
 const server = http.createServer((req, res) => {
   respond(port, req, res);
 });
+listeningServer = server;
 
 server.listen(port, '127.0.0.1', () => {
   void publishReady(port);
@@ -152,7 +168,9 @@ function respond(actualPort, req, res) {
     console.log('SHUTDOWN-RECEIVED');
     res.writeHead(202, { 'content-type': 'application/json' });
     res.end(JSON.stringify({ ok: true }));
-    setTimeout(() => process.exit(0), 100);
+    const exitDelay = Number(process.env.DSH_FAKE_EXIT_DELAY_MS) || 100;
+    if (exitDelay > 100) listeningServer.close();
+    setTimeout(() => process.exit(0), exitDelay);
     return;
   }
   if (!noManager && req.method === 'GET' && req.url === '/_manager/sessions') {
