@@ -74,6 +74,16 @@ GET /_manager/sessions          （dsh 配套插件，lifecycle 同款 allow() �
 
 #### 8.10.1 M12 会话推送（SSE，2026-08-26 定稿）
 
+**rc.2 修复契约（2026-10-18；覆盖下文旧恢复描述）**：新 SSE 连接不得单独前移共享
+广播基线：已有客户端时先用同一当前快照广播语义差异，再给新客户端 snapshot；首连接
+初始化基线。子会话 dispose 先保存父关联、删除活跃索引，再计算父摘要，迟到 end 幂等。
+浏览器收到有效 snapshot 才视为 live，任何 error 立即取消 live、关闭旧流，15 秒退避；
+5 秒无 snapshot 同样恢复，可见/隐藏都重试。回调绑定连接代次，旧流/旧 HTTP 响应不得
+覆盖新快照。失联清本标签陈旧提醒并复位完成状态，未知不等于完成，不得产生假的 !。
+HTTP 摘要是回退并刷新镜像，Popup native 2 秒保底保留；两端都不可用则只显示实例状态，
+**不再全页扫描 data-state 生成精确计数或待确认**。摘要/SSE/镜像字段不变，无新权限。
+会话行导航以 §8.2 为准：恢复只读，不保留伪 hash 深链。
+
 **动机**：M9 后所有消费面都靠轮询——popup 2s（native 往返：每次 spawn 宿主进程 + 状态探测 + 端点 1.5s 快取）、面板隐藏时 **1Hz/标签** 打 `/_manager/sessions`（贴着 Chrome 隐藏页节流上限）、徽标 30s alarms。会话状态切换（working→waiting approval、子代理 start/end、turn/end）的感知延迟 1s~30s 且空轮询消耗真实网络/进程开销。**目标**：状态变化由 dsh 宿主事件即时推送，0 延迟、0 空轮询。
 
 **事件源（0.1.1-rc.2 源码核验，见 §2 M12 注记）**：Cordis 事件总线——`session/created` / `session/event`（append 同步触发，种子不发射）/ `session/disposed` / `agent/status`（`{status, agent}`）。插件挂载于 app 层（untagged），按 dsh-scope `scopeTarget` 语义**接收全部作用域会话事件**（与官方 apiproxy 订阅模式同构）。
@@ -107,7 +117,7 @@ GET /_manager/events          （SSE；lifecycle 同款 allow() 围栏；只读�
 
 | 消费面 | 链路 | 延迟 | 降级 |
 |---|---|---|---|
-| 页面面板/徽标（一级，收益主体） | 面板（content script，**同源页面**）`EventSource('/_manager/events')` → 事件即更新计数 → 既有 `attention` 上报 SW → 徽标/面板 | <100ms | SSE 失败/插件缺失 → 1Hz 端点轮询 → DOM 扫描（现状路径不变） |
+| 页面面板/徽标（一级，收益主体） | 面板（content script，**同源页面**）`EventSource('/_manager/events')` → 事件即更新计数 → 既有 `attention` 上报 SW → 徽标/面板 | <100ms | SSE 失败 → 1Hz 摘要轮询；两者均不可用 → 仅实例状态，无 DOM 猜测 |
 | popup 会话区（二级） | 面板事件 → SW `sessions-sync`（按端口去重）→ `storage.local.sessionsCache`（防抖 100ms）→ popup `storage.onChanged` 即时渲染 | <500ms | 无 dsh 标签/镜像缺失 → native `sessions` 2s 轮询（现状，为正确性保底） |
 
 - **popup 不能直连**：`chrome-extension://` Origin 被 `allow()` 围栏拒绝（与 `/_manager/sessions` 相同）——镜像桥只经扩展内部 storage，**只存摘要 items（不读消息内容/文本，§12.2 边界不变）**；无宿主协议变更（§6.2 不动）、无新增权限。

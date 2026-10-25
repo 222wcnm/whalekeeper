@@ -9,6 +9,26 @@
 
 ## verify-cdp.js（推荐先用）
 
+2026-10-26 发布前重新完成三轮真实隔离 E2E **196/196**，含 Chrome 156 **121/121**。
+扩展页面与托管面板等待实际就绪，合成帧仅派发到已注入的本扩展隔离上下文，避免固定
+sleep 在慢启动/重载时误报。正式证据根 `.e2e-current/run-mvo3y5wp-91931053/`。
+本轮工具进程对原 AppData 安装目录的路径访问异常慢；用户独立终端对照正常，因此选择
+同字节 D 盘 CLI 副本复验，生产源码及 150s 预算原样，详见 `native-host/test/VERIFICATION.md`。
+下述三轮数据为 2026-10-19 历史验收，与本轮重新执行分别保留。
+
+0.2.1-rc.2 Chrome 155 已通过 **121/121**（2026-10-19），最终三轮生产源码隔离
+集成验收 **196/196**（第一轮运行浏览器，后两轮固定/动态生命周期），全部通过。
+旧表的 33 条是 M3 历史记录；修复前已有 108 条基线。
+新增用例验证会话行只读、认证页另开、有效端口与真实 SSE 断线/隐藏重连（有隔离 fixture
+时必须运行）。建议通过 `native-host/test/e2e-current-isolated.js` 的
+`DSH_MANAGER_VERIFY_UI=1` 调起，子进程沿用隔离状态，不触及日常实例。
+认证证据可由 `VERIFY_DSH_MANAGER_BASE_DIR` 指定，`VERIFY_FIXTURE_URL` 为本 case 控制端点，
+`VERIFY_EVIDENCE_DIR` 为 case 产物目录；普通独立运行没有 fixture 时仅新增恢复段明确 SKIP。
+Windows 隔离时同时建立 `USERPROFILE/AppData/Local` 与 Roaming：Chrome 的默认目录
+判定使用已知文件夹 API，Local 不存在会令 CDP 安全检查无法确认非默认 profile。
+Chrome profile 保持全新、同 case、短路径；不读取日常 profile，也不关闭默认目录保护。
+启动失败证据保存在同 case 的 `chrome-stderr.log`，输出仅保留脱敏尾部与本次进程状态。
+
 ```powershell
 node tools/verify-ui/verify-cdp.js
 ```

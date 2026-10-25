@@ -22,12 +22,18 @@ const { spawn, spawnSync } = require('child_process');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const http = require('http');
 
 const ROOT = path.resolve(__dirname, '..', '..');
 const EXT_DIR = path.join(ROOT, 'extension');
-const SHOTS_DIR = path.join(__dirname, 'shots');
+const SHOTS_DIR = path.resolve(process.env.VERIFY_EVIDENCE_DIR || path.join(__dirname, 'shots'));
+const FIXTURE_URL = process.env.VERIFY_FIXTURE_URL || null;
+const CHROME_STDERR_PATH = path.join(SHOTS_DIR, 'chrome-stderr.log');
 const PORT = Number(process.env.VERIFY_CDP_PORT) || 9335;
-const PROFILE = path.join(os.tmpdir(), 'dsh-verify-ui-' + Date.now());
+const PROFILE = process.env.VERIFY_CHROME_PROFILE_DIR
+  ? path.resolve(process.env.VERIFY_CHROME_PROFILE_DIR)
+  : path.join(process.env.VERIFY_EVIDENCE_DIR ? SHOTS_DIR : os.tmpdir(), 'dsh-verify-ui-' + process.pid + '-' + Date.now());
+const VERIFY_TIMEOUT_MS = 225000; // 先自行关闭本 case Chrome，外层 240s 仅兜底
 const CHROME_CANDIDATES = [
   ...(process.env.CHROME_PATH ? [process.env.CHROME_PATH] : []),
   'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
@@ -39,6 +45,9 @@ const CHROME_CANDIDATES = [
 const results = [];
 let chromeProc = null;
 let browserWs = null;
+let cleanupPromise = null;
+let watchdog = null;
+let profileOwned = false;
 
 // M10 颜色语义默认色板（M10.1 定稿 2026-08-24：三角色三色——等待黄/进行中蓝/完成绿；
 // done 并入 completed、idle 不再展示；与 colors.js DEFAULT / background.js DEFAULT 一致）
@@ -49,7 +58,7 @@ const DSH_COLORS_DEFAULT = {
 };
 
 // M8 e2e（2026-08-24 起徽标计数与 popup 会话区同源）：content script 同源端点
-// GET /_manager/sessions（端点优先，DOM 仅回退）。e2e 用 Fetch 域拦截该端点请求，
+// GET /_manager/sessions（端点失败保持未知，不扫页面 DOM）。e2e 只在基线段拦截该端点，
 // 以 sessionsMockProvider() 返回的 items 构造响应驱动真实链路（content script →
 // SW → 徽标）；provider 为 null 时原请求放行。仅 verify 测试期使用。
 let sessionsMockProvider = null;
@@ -74,61 +83,106 @@ async function fulfillSessionsMock(page, requestId) {
   });
 }
 
-// M13（2026-09-04）：dsh ≥ 0.1.2 起裸 URL 受浏览器启动令牌认证（GET / 无凭据 → 401 纯文本页，
-// 无 document.title → panel.js 注入指纹不满足 → 面板段全失效）。verify 在导航到 dshUrl 前
-// 先做认证引导：探测 401 → 读宿主 run 记录 launchUrl（含 token，§12.3）或宿主日志最后一条
-// `dsh web: <url>` 行 → 导航兑换签名 cookie（303 → 干净 /）→ 之后所有 dshUrl 访问自动带 cookie。
-// 仅本机同信任域读取（与宿主一致），不写 storage、不转发 token。外部实例（无 run 记录/日志）
-// 无 token 可循 → 返回 false（面板段受限，如实记录）。
+// 所有 dsh HTTP 探测走 Node http：不发 Accept-Encoding、不自动跟随重定向、总截止有界。
+function httpGet(url, timeoutMs = 15000) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const finish = (error, value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (error) reject(error); else resolve(value);
+    };
+    const req = http.get(url, { agent: false, headers: {} }, (res) => {
+      let body = '';
+      res.setEncoding('utf8');
+      res.on('data', (chunk) => {
+        body += chunk;
+        if (body.length > 1024 * 1024) req.destroy(new Error('HTTP response exceeds 1 MiB'));
+      });
+      res.on('end', () => finish(null, { status: res.statusCode, headers: res.headers, body }));
+      res.on('error', (error) => finish(error));
+      res.on('aborted', () => finish(new Error('HTTP response aborted')));
+    });
+    const timer = setTimeout(() => req.destroy(new Error('HTTP deadline exceeded')), timeoutMs);
+    req.on('error', (error) => finish(error));
+  });
+}
+
+function loopbackHttpUrl(value) {
+  try {
+    const url = new URL(value);
+    return url.protocol === 'http:' && ['127.0.0.1', 'localhost'].includes(url.hostname)
+      && !url.username && !url.password ? url : null;
+  } catch (_) { return null; }
+}
+
+function validLaunchUrl(value, port) {
+  const url = loopbackHttpUrl(value);
+  if (!url || Number(url.port || 80) !== port || url.pathname !== '/' || url.hash) return null;
+  const entries = [...url.searchParams];
+  if (entries.length !== 1 || entries[0][0] !== 'token' || !/^[A-Za-z0-9._~-]{1,4096}$/.test(entries[0][1])) return null;
+  return url.href;
+}
+
+// M13：只从指定本 case base 取认证证据；显式指定后绝不回退日常 LOCALAPPDATA。
+// 令牌仅用于同端口根首页兑换 cookie，不进日志/storage/消息或报告。
 async function ensureDshAuth(page, dshUrl) {
   try {
-    const head = await fetch(dshUrl, { signal: AbortSignal.timeout(1500) });
-    if (head.ok) return true; // 无需认证（rc.2 或已带 cookie）
+    const expected = loopbackHttpUrl(dshUrl);
+    if (!expected) return false;
+    const port = Number(expected.port || 80);
+    const head = await httpGet(expected.origin + '/', 5000);
+    if (head.status === 200) return true;
     if (head.status !== 401) return false;
+    const base = process.env.VERIFY_DSH_MANAGER_BASE_DIR
+      || (process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, 'dsh-manager') : null);
     let launchUrl = null;
-    if (process.env.LOCALAPPDATA) {
+    if (base) {
       try {
-        const rec = JSON.parse(fs.readFileSync(path.join(process.env.LOCALAPPDATA, 'dsh-manager', 'run', 'dsh-web.json'), 'utf8'));
-        if (rec && typeof rec.launchUrl === 'string' && rec.launchUrl.includes('?token=')) launchUrl = rec.launchUrl;
-      } catch (_) { /* 无 run 记录 */ }
+        const rec = JSON.parse(fs.readFileSync(path.join(base, 'run', 'dsh-web.json'), 'utf8'));
+        if (rec && Number(rec.port) === port) launchUrl = validLaunchUrl(rec.launchUrl, port);
+      } catch (_) { /* 当前 case 无 run 记录 */ }
       if (!launchUrl) {
         try {
-          const raw = fs.readFileSync(path.join(process.env.LOCALAPPDATA, 'dsh-manager', 'logs', 'dsh-web.log'), 'utf8');
-          let m;
+          const raw = fs.readFileSync(path.join(base, 'logs', 'dsh-web.log'), 'utf8');
           const re = /dsh\s*web:\s*(https?:\/\/[^\s]+)/gi;
-          while ((m = re.exec(raw)) !== null) if (m[1].includes('?token=')) launchUrl = m[1];
-        } catch (_) { /* 无日志 */ }
+          let match;
+          while ((match = re.exec(raw)) !== null) launchUrl = validLaunchUrl(match[1], port) || launchUrl;
+        } catch (_) { /* 当前 case 无日志 */ }
       }
     }
     if (!launchUrl) return false;
-    await page.send('Page.navigate', { url: launchUrl }); // token 兑换 303 → / 并落 cookie
-    // 浏览器内校验（Node fetch 无浏览器 cookie，不可用作校验）：轮询 document.title
-    // 出现 DeepSeek Harness 指纹即兑换成功（401 页无 title，SPA 才有）。
-    const deadline = Date.now() + 12000;
-    for (;;) {
-      const ev = await page.send('Runtime.evaluate', {
-        expression: 'document.title',
-        returnByValue: true,
-      });
-      const title = ev && ev.result ? String(ev.result.value || '') : '';
-      if (/deepseek\s*harness/i.test(title)) return true;
-      if (Date.now() >= deadline) return false;
-      await sleep(1000);
-    }
-  } catch (_) {
-    return false;
+    await page.send('Page.navigate', { url: launchUrl });
+    // 只在浏览器 cookie jar 内校验认证；不读取 cookie/页面正文。
+    return waitUntil(async () => {
+      const ev = await page.send('Runtime.evaluate', { expression: 'document.title', returnByValue: true });
+      return /deepseek\s*harness/i.test(String(ev && ev.result && ev.result.value || ''));
+    }, 12000);
+  } catch (_) { return false; }
+}
+
+function redact(value) {
+  return String(value).replace(/([?&]token=)[^&#\s"'<>]+/gi, '$1[REDACTED]')
+    .replace(/("token"\s*:\s*")[^"]*/gi, '$1[REDACTED]');
+}
+function log(...a) { console.log('[verify-cdp]', ...a.map(redact)); }
+function record(name, ok, detail) {
+  results.push({ name, ok: !!ok });
+  console.log(redact(`${ok ? 'PASS' : 'FAIL'} | ${name}${detail ? ' | ' + detail : ''}`));
+}
+function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
+async function waitUntil(fn, timeoutMs, intervalMs = 250) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    try { if (await fn()) return true; } catch (_) { /* 导航/上下文切换暂不可读：轮询 */ }
+    if (Date.now() >= deadline) return false;
+    await sleep(Math.min(intervalMs, Math.max(1, deadline - Date.now())));
   }
 }
 
-function log(...a) { console.log('[verify-cdp]', ...a); }
-function record(name, ok, detail) {
-  results.push({ name, ok });
-  console.log(`${ok ? 'PASS' : 'FAIL'} | ${name}${detail ? ' | ' + detail : ''}`);
-}
-function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
-
 async function fail(msg) {
-  console.error('[verify-cdp] 失败: ' + msg);
+  console.error('[verify-cdp] 失败: ' + redact(msg));
   await cleanup();
   process.exit(1);
 }
@@ -142,14 +196,37 @@ async function fetchJson(url, opts) {
   return r.json();
 }
 
+function chromeStartupDiagnostic() {
+  let tail = '';
+  try {
+    const fd = fs.openSync(CHROME_STDERR_PATH, 'r');
+    try {
+      const size = fs.fstatSync(fd).size;
+      const buffer = Buffer.alloc(Math.min(size, 4096));
+      fs.readSync(fd, buffer, 0, buffer.length, Math.max(0, size - buffer.length));
+      tail = redact(buffer.toString('utf8')).trim();
+    } finally { fs.closeSync(fd); }
+  } catch (_) { /* 启动尚未写 stderr：保留空 tail */ }
+  return JSON.stringify({ pid: chromeProc && chromeProc.pid, exitCode: chromeProc && chromeProc.exitCode,
+    signal: chromeProc && chromeProc.signalCode, profileLength: PROFILE.length,
+    stderr: CHROME_STDERR_PATH, stderrTail: tail });
+}
+
 async function waitVersion() {
+  let lastError = '';
   for (let i = 0; i < 60; i++) {
+    if (chromeProc && (chromeProc.exitCode !== null || chromeProc.signalCode !== null)) {
+      throw new Error('Chrome 在 CDP 就绪前退出 | ' + chromeStartupDiagnostic());
+    }
     try {
       const v = await fetchJson('http://127.0.0.1:' + PORT + '/json/version');
       return v;
-    } catch (_) { await sleep(250); }
+    } catch (error) {
+      lastError = redact(error && error.message || error);
+      await sleep(250);
+    }
   }
-  throw new Error('Chrome CDP 未就绪（60 次轮询失败）');
+  throw new Error('Chrome CDP 未就绪（60 次轮询失败） | lastCDP=' + lastError + ' | ' + chromeStartupDiagnostic());
 }
 
 // WebSocket CDP 会话：send(method, params) -> result；事件进入 onEvent 回调
@@ -184,6 +261,254 @@ function connectWs(url, onEvent) {
   });
 }
 
+// rc.2 真实恢复验收：独立标签不启用 Fetch 拦截、不 dispatch 合成帧，不替换 EventSource。
+// fixture 只操作本 case 的真实 Session 和连接开关，named SSE 帧必须由真实插件产生。
+async function verifyRealSseRecovery(dshUrl, extId, originalPage, originalTabId) {
+  if (!FIXTURE_URL) {
+    const required = process.env.DSH_MANAGER_VERIFY_UI === '1';
+    record('rc.2：真实 SSE 断线/隐藏重连', !required,
+      required ? '正式隔离 E2E 缺少 VERIFY_FIXTURE_URL，禁止静默跳过' : 'SKIP——未提供隔离 fixture（仅本段，既有真实路径仍保留）');
+    return;
+  }
+  const dsh = loopbackHttpUrl(dshUrl);
+  const fixture = loopbackHttpUrl(FIXTURE_URL);
+  if (!dsh || !fixture || fixture.origin !== dsh.origin || fixture.pathname !== '/_fixture' || fixture.search || fixture.hash) {
+    record('rc.2：真实 SSE fixture 范围', false, 'fixture 必须为被验实例同源 /_fixture，不访问其他实例');
+    return;
+  }
+  const actualPort = Number(dsh.port || 80);
+  const evidence = { fixtureConfigured: true, port: actualPort, timings: {}, frames: [], assertions: {} };
+  const fixtureAction = async (action) => {
+    const url = new URL(fixture);
+    url.searchParams.set('action', action);
+    const res = await httpGet(url.href);
+    if (res.status !== 200) throw new Error('fixture ' + action + ' HTTP ' + res.status);
+    const data = JSON.parse(res.body);
+    if (!data || data.ok !== true || typeof data.sessionId !== 'string') throw new Error('fixture ' + action + ' invalid JSON contract');
+    return data;
+  };
+  const canonical = (value) => {
+    if (Array.isArray(value)) return value.map(canonical);
+    if (!value || typeof value !== 'object') return value;
+    return Object.fromEntries(Object.keys(value).sort().map((key) => [key, canonical(value[key])]));
+  };
+  const sameItems = (left, right) => Array.isArray(left) && Array.isArray(right)
+    && JSON.stringify(canonical([...left].sort((a, b) => a.sessionId.localeCompare(b.sessionId))))
+      === JSON.stringify(canonical([...right].sort((a, b) => a.sessionId.localeCompare(b.sessionId))));
+  let realTab = null, realPage = null, sw = null, originalSettings = null, sessionId = null, chromeTabId = null;
+  let fixtureTouched = false, falseDone = false, lastPage = null, lastSw = null;
+  let eventsRequests = 0, sessionsResponses = 0;
+  const sessionRequestIds = new Set();
+  const eventRequestIds = new Set();
+  const frames = [];
+  const stage = (name, ok, detail) => {
+    evidence.assertions[name] = !!ok;
+    record(name, ok, detail);
+    if (!ok) throw new Error('真实恢复前置未满足：' + name);
+  };
+  try {
+    log('rc.2：独立真实标签 SSE → 断线 HTTP 回退 → hidden 重连（无帧合成/网络 mock）');
+    // 卸载主标签中的合成挂钩状态，避免另一标签陈旧镜像/提醒污染真实断线证据。
+    await originalPage.send('Page.navigate', { url: 'about:blank' });
+    let swTarget;
+    const swReady = await waitUntil(async () => {
+      swTarget = (await fetchJson('http://127.0.0.1:' + PORT + '/json/list'))
+        .find((target) => target.type === 'service_worker' && (target.url || '').includes(extId));
+      return !!swTarget;
+    }, 5000);
+    if (!swReady) throw new Error('真实恢复缺少扩展 SW（不可 SKIP）');
+    sw = await connectWs(swTarget.webSocketDebuggerUrl);
+    await sw.send('Runtime.enable');
+    const swEval = async (expression) => {
+      const result = await sw.send('Runtime.evaluate', { expression, awaitPromise: true, returnByValue: true });
+      if (result.exceptionDetails) throw new Error('SW Runtime.evaluate exception');
+      return result && result.result ? result.result.value : undefined;
+    };
+    originalSettings = await swEval('(async () => (await chrome.storage.local.get("settings")).settings || {})()');
+    await swEval(`(async () => {
+      const settings = (await chrome.storage.local.get('settings')).settings || {};
+      await chrome.storage.local.set({ settings: { ...settings, port: ${actualPort}, attention: true, attentionDone: true }, attentionMap: {}, sessionsCache: {} });
+    })()`);
+    fixtureTouched = true;
+    const initial = await fixtureAction('reset');
+    sessionId = initial.sessionId;
+    evidence.sessionId = sessionId;
+    evidence.initial = initial;
+    stage('rc.2 真实 SSE：隔离 fixture 真实 Session/连接开关可用',
+      initial.state === 'idle' && initial.eventsEnabled === true, JSON.stringify(initial));
+
+    realTab = await fetchJson('http://127.0.0.1:' + PORT + '/json/new?about:blank', { method: 'PUT' });
+    realPage = await connectWs(realTab.webSocketDebuggerUrl, (message) => {
+      const params = message.params || {};
+      if (message.method === 'Network.requestWillBeSent') {
+        const url = params.request && params.request.url;
+        if (url === dsh.origin + '/_manager/events') { eventsRequests += 1; eventRequestIds.add(params.requestId); }
+        if (url === dsh.origin + '/_manager/sessions') sessionRequestIds.add(params.requestId);
+      } else if (message.method === 'Network.responseReceived') {
+        if (sessionRequestIds.has(params.requestId) && params.response && params.response.status === 200) sessionsResponses += 1;
+      } else if (message.method === 'Network.eventSourceMessageReceived') {
+        if (!eventRequestIds.has(params.requestId)) return;
+        let data;
+        try { data = JSON.parse(params.data); } catch (_) { return; }
+        // Network 域的 EventSource 事件由浏览器网络栈产生，DOM 合成帧无法生成此证据。
+        if (params.eventName === 'snapshot' && data.ok === true && Array.isArray(data.items)) {
+          frames.push({ event: 'snapshot', items: data.items, at: Date.now() });
+        } else if (params.eventName === 'upsert' && data.session && data.session.sessionId === sessionId) {
+          frames.push({ event: 'upsert', session: data.session, at: Date.now() });
+        }
+      }
+    });
+    await realPage.send('Page.enable');
+    await realPage.send('Runtime.enable');
+    await realPage.send('Network.enable');
+    await browserWs.send('Target.activateTarget', { targetId: realTab.id });
+    const started = Date.now();
+    await realPage.send('Page.navigate', { url: dsh.origin + '/' });
+    const readPage = async () => {
+      const result = await realPage.send('Runtime.evaluate', {
+        expression: `({ injected: !!document.getElementById('dsh-manager-panel-host'), hidden: document.hidden,
+          alive: document.documentElement.getAttribute('data-dshm-sse-alive'),
+          count: document.documentElement.getAttribute('data-dshm-sse-count') })`,
+        returnByValue: true,
+      });
+      lastPage = result && result.result ? result.result.value : null;
+      return lastPage;
+    };
+    const readSw = async () => {
+      lastSw = await swEval(`(async () => {
+        const stored = await chrome.storage.local.get({ sessionsCache: {}, attentionMap: {} });
+        const entry = stored.sessionsCache[String(${actualPort})] || null;
+        return { entry, attention: stored.attentionMap[String(${chromeTabId})] || null, badge: await chrome.action.getBadgeText({}) };
+      })()`);
+      if (lastSw && (lastSw.badge === '!' || lastSw.attention && lastSw.attention.kind === 'done')) falseDone = true;
+      return lastSw;
+    };
+    const mirrorItem = (state) => lastSw && lastSw.entry && lastSw.entry.items
+      .some((item) => item.sessionId === sessionId && item.state === state);
+    const snapshotReady = await waitUntil(async () => {
+      const probe = await readPage();
+      await readSw();
+      const snapshot = frames.find((frame) => frame.event === 'snapshot' && frame.items.some((item) => item.sessionId === sessionId));
+      return probe && probe.injected && probe.alive === '1' && snapshot
+        && probe.count === String(snapshot.items.length) && mirrorItem('idle') && sameItems(lastSw.entry.items, snapshot.items);
+    }, 12000);
+    evidence.timings.snapshotMs = Date.now() - started;
+    stage('rc.2 真实 SSE：有效网络 snapshot 后 alive=1，count 与摘要镜像相符', snapshotReady,
+      JSON.stringify({ page: lastPage, networkSnapshots: frames.filter((frame) => frame.event === 'snapshot').length,
+        snapshotMs: evidence.timings.snapshotMs, mirrorItems: lastSw && lastSw.entry && lastSw.entry.items.length }));
+    chromeTabId = await swEval(`(async () => {
+      const tabs = await chrome.tabs.query({});
+      const matched = tabs.filter((tab) => { try { return new URL(tab.url).origin === ${JSON.stringify(dsh.origin)}; } catch (_) { return false; } });
+      return matched.length === 1 ? matched[0].id : null;
+    })()`);
+    if (!Number.isInteger(chromeTabId)) throw new Error('真实 SSE 独立标签不是唯一同源页');
+    await fixtureAction('ask');
+    // 用真标签激活造成 document.hidden，不用属性覆盖/合成 visibilitychange。
+    await browserWs.send('Target.activateTarget', { targetId: originalTabId });
+    const waitingReady = await waitUntil(async () => {
+      await readPage(); await readSw();
+      return lastPage && lastPage.hidden === true && mirrorItem('waiting')
+        && frames.some((frame) => frame.event === 'upsert' && frame.session.state === 'waiting')
+        && lastSw.attention && lastSw.attention.kind === 'waiting' && lastSw.badge === '?';
+    }, 5000);
+    stage('rc.2 真实 SSE：后台 waiting 真 upsert → 同标签黄?与 sessionsCache 一致', waitingReady && !falseDone,
+      JSON.stringify({ page: lastPage, attention: lastSw && lastSw.attention, badge: lastSw && lastSw.badge }));
+
+    const beforeLossResponses = sessionsResponses;
+    const beforeLossAt = lastSw.entry.at;
+    const disconnectedAt = Date.now();
+    const disabled = await fixtureAction('events-off');
+    const offline = await waitUntil(async () => (await readPage()).alive === '0', 2500, 100);
+    evidence.timings.cancelLiveMs = Date.now() - disconnectedAt;
+    stage('rc.2 真实 SSE：服务端主动断流后立即取消 live（alive=0，无假完成）',
+      disabled.eventsEnabled === false && offline,
+      JSON.stringify({ page: lastPage, cancelLiveMs: evidence.timings.cancelLiveMs, eventsEnabled: disabled.eventsEnabled }));
+    const fallback = await waitUntil(async () => {
+      await readPage(); await readSw();
+      return lastPage && lastPage.hidden && lastPage.alive === '0' && mirrorItem('waiting')
+        && sessionsResponses >= beforeLossResponses + 2 && lastSw.entry.at > beforeLossAt
+        && lastSw.attention && lastSw.attention.kind === 'waiting' && lastSw.badge === '?';
+    }, 5000);
+    const duringLoss = await fixtureAction('state');
+    evidence.disconnected = duringLoss;
+    evidence.timings.fallbackMs = Date.now() - disconnectedAt;
+    stage('rc.2 真实 SSE：断线期间真实 HTTP 持续 waiting、更新镜像且不产生假的!',
+      fallback && !falseDone && duringLoss.eventsEnabled === false,
+      JSON.stringify({ http200Responses: sessionsResponses - beforeLossResponses, page: lastPage,
+        mirrorAtAdvanced: lastSw && lastSw.entry && lastSw.entry.at > beforeLossAt, falseDone, state: duringLoss.state }));
+
+    const snapshotsBeforeReconnect = frames.filter((frame) => frame.event === 'snapshot').length;
+    const requestsBeforeReconnect = eventsRequests;
+    await fixtureAction('events-on');
+    const reenabledAt = Date.now();
+    const reconnected = await waitUntil(async () => {
+      await readPage(); await readSw();
+      const snapshots = frames.filter((frame) => frame.event === 'snapshot');
+      const snapshot = snapshots[snapshots.length - 1];
+      return lastPage && lastPage.hidden && lastPage.alive === '1'
+        && eventsRequests > requestsBeforeReconnect && snapshots.length > snapshotsBeforeReconnect
+        && snapshot && lastPage.count === String(snapshot.items.length) && mirrorItem('waiting')
+        && sameItems(lastSw.entry.items, snapshot.items) && lastSw.badge === '?';
+    }, 25000);
+    evidence.timings.hiddenReconnectMs = Date.now() - reenabledAt;
+    const afterReconnect = await fixtureAction('state');
+    evidence.reconnected = afterReconnect;
+    stage('rc.2 真实 SSE：页面持续 hidden，15s 退避后 25s 内重连真 snapshot 并恢复 live',
+      reconnected && !falseDone && afterReconnect.eventsEnabled === true
+        && afterReconnect.eventRequests > duringLoss.eventRequests,
+      JSON.stringify({ page: lastPage, hiddenReconnectMs: evidence.timings.hiddenReconnectMs,
+        eventRequests: eventsRequests, snapshots: frames.filter((frame) => frame.event === 'snapshot').length, falseDone }));
+
+    const completedAt = Date.now();
+    await fixtureAction('finish');
+    const completed = await waitUntil(async () => {
+      await readPage(); await readSw();
+      return lastPage && lastPage.hidden && lastPage.alive === '1' && mirrorItem('completed')
+        && frames.some((frame) => frame.event === 'upsert' && frame.at >= completedAt && frame.session.state === 'completed');
+    }, 5000);
+    const listingResponse = await httpGet(dsh.origin + '/_manager/sessions');
+    const listing = JSON.parse(listingResponse.body);
+    const completedFrame = [...frames].reverse().find((frame) => frame.event === 'upsert' && frame.session.state === 'completed');
+    evidence.timings.completedMs = Date.now() - completedAt;
+    stage('rc.2 真实 SSE：恢复后 finish 真 completed upsert，与 HTTP/摘要镜像完全一致',
+      completed && listingResponse.status === 200 && listing.ok === true && sameItems(lastSw.entry.items, listing.items)
+        && !!completedFrame && sameItems([completedFrame.session], listing.items.filter((item) => item.sessionId === sessionId)),
+      JSON.stringify({ page: lastPage, completedMs: evidence.timings.completedMs,
+        fixtureState: completedFrame && completedFrame.session.state, mirrorMatchesHttp: sameItems(lastSw.entry.items, listing.items) }));
+  } catch (error) {
+    evidence.error = redact(error && error.message || error);
+    record('rc.2：真实 SSE 断线/隐藏重连完整执行（fixture 已配置，不允许 SKIP）', false, evidence.error);
+  } finally {
+    evidence.frames = frames.map((frame) => ({ event: frame.event, at: frame.at,
+      count: frame.items ? frame.items.length : undefined,
+      state: frame.session ? frame.session.state : undefined }));
+    evidence.network = { eventsRequests, sessionsResponses };
+    evidence.falseDone = falseDone;
+    if (realTab) await browserWs.send('Target.closeTarget', { targetId: realTab.id }).catch(() => { });
+    if (realPage) realPage.ws.close();
+    if (fixtureTouched) {
+      try {
+        const restored = await fixtureAction('reset');
+        evidence.restored = { state: restored.state, eventsEnabled: restored.eventsEnabled };
+      } catch (error) {
+        evidence.cleanupError = redact(error && error.message || error);
+        record('rc.2：真实 SSE fixture 恢复', false, evidence.cleanupError);
+      }
+    }
+    if (sw) {
+      try {
+        await sw.send('Runtime.evaluate', {
+          expression: `(async () => { await chrome.storage.local.set({ settings: ${JSON.stringify(originalSettings || {})}, attentionMap: {}, sessionsCache: {} }); })()`,
+          awaitPromise: true, returnByValue: true,
+        });
+      } catch (_) { /* 浏览器最终 cleanup 仍关闭整个独立 profile */ }
+      sw.ws.close();
+    }
+    await browserWs.send('Target.activateTarget', { targetId: originalTabId }).catch(() => { });
+    fs.writeFileSync(path.join(SHOTS_DIR, 'real-sse-recovery.json'), redact(JSON.stringify(evidence, null, 2)), 'utf8');
+  }
+}
+
 // ---------------------------------------------------------------------------
 // 主流程
 // ---------------------------------------------------------------------------
@@ -192,22 +517,31 @@ async function main() {
   if (!chromePath) fail('未找到 Chrome/Edge 可执行文件（可设 CHROME_PATH）');
   log('Chrome: ' + chromePath);
   fs.mkdirSync(SHOTS_DIR, { recursive: true });
+  // 只使用全新 case profile；不能复用或 cleanup 一个本来存在的用户目录。
+  if (fs.existsSync(PROFILE)) return fail('独立 Chrome profile 已存在，拒绝复用/删除: ' + PROFILE);
+  fs.mkdirSync(PROFILE, { recursive: true });
+  profileOwned = true;
 
   log('启动 headless Chrome（profile: ' + PROFILE + '）');
-  chromeProc = spawn(chromePath, [
-    '--headless=new',
-    '--remote-debugging-port=' + PORT,
-    '--user-data-dir=' + PROFILE,
-    '--no-first-run',
-    '--no-default-browser-check',
-    '--ignore-gpu-blocklist',
-    '--enable-gpu-rasterization',
-    '--enable-zero-copy',
-    '--window-size=1280,900',
-    '--enable-unsafe-extension-debugging', // 新版 Chrome 可能已无需此旗标，传了也无害
-    'about:blank',
-  ], { stdio: 'ignore', windowsHide: true });
-  chromeProc.on('error', (e) => fail('Chrome 启动失败: ' + e.message));
+  // 文件句柄继承而非 stdio pipe：保持 Windows native sandbox 的已知边界；仅本 case 诊断。
+  const stderrFd = fs.openSync(CHROME_STDERR_PATH, 'w');
+  try {
+    chromeProc = spawn(chromePath, [
+      '--headless=new',
+      '--remote-debugging-port=' + PORT,
+      '--user-data-dir=' + PROFILE,
+      '--no-first-run',
+      '--no-default-browser-check',
+      '--ignore-gpu-blocklist',
+      '--enable-gpu-rasterization',
+      '--enable-zero-copy',
+      '--window-size=1280,900',
+      '--enable-unsafe-extension-debugging', // 新版 Chrome 可能已无需此旗标，传了也无害
+      'about:blank',
+    ], { stdio: ['ignore', 'ignore', stderrFd], windowsHide: true });
+  } finally { fs.closeSync(stderrFd); }
+  log('Chrome 启动诊断: pid=' + chromeProc.pid + ' profileLength=' + PROFILE.length + ' stderr=' + CHROME_STDERR_PATH);
+  chromeProc.on('error', (e) => fail('Chrome 启动失败: ' + e.message + ' | ' + chromeStartupDiagnostic()));
   const version = await waitVersion();
   log('CDP 就绪: ' + version.Browser);
 
@@ -257,8 +591,20 @@ async function main() {
   await page.send('Page.enable');
 
   const visit = async (path, label) => {
-    await page.send('Page.navigate', { url: 'chrome-extension://' + extId + '/' + path });
-    await sleep(3000); // 等页面脚本与 chrome.* 异步调用收敛
+    const url = 'chrome-extension://' + extId + '/' + path;
+    await page.send('Page.navigate', { url });
+    await waitUntil(async () => {
+      const ready = await page.send('Runtime.evaluate', {
+        expression: `(() => {
+          if (location.href !== ${JSON.stringify(url)} || !document.body) return false;
+          const text = document.body.innerText;
+          if (${JSON.stringify(path)} === 'logs.html') return text.includes('未安装宿主') || text.includes('日志文件：');
+          const state = document.getElementById('state-word');
+          return !!state && !!state.textContent.trim() && state.textContent.trim() !== '—';
+        })()`, returnByValue: true,
+      });
+      return ready.result?.value === true;
+    }, 25000);
     const ev = await page.send('Runtime.evaluate', {
       expression: 'document.body ? document.body.innerText : ""',
       returnByValue: true,
@@ -329,8 +675,18 @@ async function main() {
   record('M13：dsh 页面认证引导（rc.1 token 兑换）', authOk,
     authOk ? 'cookie 已就绪，dshUrl 可 200' : '无 launchUrl 可循（外部实例）——面板/SSE/主题面板段将受限');
   log('访问 dsh Web UI 并检查页面内管理面板: ' + dshUrl);
+  const waitForManagedPanel = () => waitUntil(async () => {
+    const ready = await page.send('Runtime.evaluate', {
+      expression: `(() => {
+        const root = document.getElementById('dsh-manager-panel-host')?.shadowRoot;
+        return !!root && root.querySelector('.dot')?.classList.contains('dot-running')
+          && /运行中.*端口 \\d+/.test(root.querySelector('.status-text')?.textContent || '');
+      })()`, returnByValue: true,
+    });
+    return ready.result?.value === true;
+  }, 25000);
   await page.send('Page.navigate', { url: dshUrl });
-  await sleep(8000); // 等 SPA 加载 + content script 注入 + 首轮 status 轮询
+  await waitForManagedPanel();
   const evp = await page.send('Runtime.evaluate', {
     expression: `(() => {
       const h = document.getElementById('dsh-manager-panel-host');
@@ -710,8 +1066,8 @@ async function main() {
         const dshPort = String(new URL(dshUrl).port || '80');
         let epAvailable = false;
         try {
-          const ep = await fetch('http://127.0.0.1:' + dshPort + '/_manager/sessions', { signal: AbortSignal.timeout(1500) });
-          epAvailable = ep.ok && (((await ep.json()) || {}).ok === true);
+          const ep = await httpGet('http://127.0.0.1:' + dshPort + '/_manager/sessions', 1500);
+          epAvailable = ep.status === 200 && (JSON.parse(ep.body) || {}).ok === true;
         } catch (_) { epAvailable = false; }
         log('M8 e2e 端点可用性: ' + epAvailable + '（endpoint=/_manager/sessions @ ' + dshPort + '）');
 
@@ -738,15 +1094,19 @@ async function main() {
             })()`,
             returnByValue: true,
           });
-          const wAttOk = await waitFor(() => attEntryKind('waiting'), 8000);
-          const wBadgeOk = await waitFor(async () => {
-            const j = await getBadgeJson();
-            return badgeHas(String(j.value || ''), '?', /#f59e0b|f59e0b|245,\s*158,\s*11/i);
-          }, 4000);
+          // rc.2 撤回全页 StateDot 扫描：没有摘要时 DOM warning 不能冒充权威 waiting。
+          let sawSpuriousWaiting = false;
+          const observationStart = Date.now();
+          await waitUntil(async () => {
+            const kinds = await attEntryKind('waiting');
+            const badge = await evalInSw('chrome.action.getBadgeText({})');
+            if (kinds.value === true || badge.value === '?' || badge.value === '!') sawSpuriousWaiting = true;
+            return Date.now() - observationStart >= 2200;
+          }, 3500);
           const bAtt = await getBadgeJson();
-          record('M8：e2e 后台+等待标记 → 黄「?」（DOM 回退路径，插件端点不可用；attentionMap 条目为链路证据）',
-            wAttOk && wBadgeOk,
-            'badge=' + String(bAtt.value || '') + ' base=' + JSON.stringify(base) + (bAtt.raw ? ' ' + bAtt.raw : ''));
+          record('M8：e2e 摘要不可用时 DOM warning 不制造待确认（rc.2 仅保留实例状态）',
+            !sawSpuriousWaiting,
+            'badge=' + String(bAtt.value || '') + ' base=' + JSON.stringify(base));
           await page.send('Runtime.evaluate', {
             expression: `(() => { const n = document.getElementById('dshm-test-warning'); if (n) n.remove(); return 'removed'; })()`,
             returnByValue: true,
@@ -768,10 +1128,7 @@ async function main() {
         const base2Info = await pageEvalInfo();
         let base2 = {};
         try { base2 = JSON.parse(String(base2Info.result.value)); } catch (_) { /* 保持默认 */ }
-        if (!epAvailable && base2.ongoing > 0) {
-          record('M8：e2e 工作→完成（done）链路——基线存在真实工作中会话，本段如实记录（非失败）',
-            true, 'ongoing=' + base2.ongoing + '（真实 dsh 会话仍在运行；done 链路待空闲环境覆盖）');
-        } else if (epAvailable) {
+        if (epAvailable) {
           // M12 后适配（2026-09-04）：面板在 SSE 存活时不轮询端点，端点 mock 永不命中
           // （mockHits=0 实证）——done「绿!」链路由下方 M12 段新增合成帧断言覆盖
           // （working 快照 → 空快照 → 稳定空态 → done-fired）。此处如实记录（非失败）。
@@ -791,20 +1148,28 @@ async function main() {
             })()`,
             returnByValue: true,
           });
-          await sleep(2500); // 让状态机进入 working（隐藏页 1Hz 节流下 2-3 tick）
+          // DOM ongoing 的出现/移除均不是权威工作完成边沿；未知不得造蓝数或绿!。
+          let sawSpuriousDone = false;
+          const watchQuiet = async (duration) => {
+            const at = Date.now();
+            await waitUntil(async () => {
+              const result = await evalInSw(`(async () => ({ badge: await chrome.action.getBadgeText({}),
+                kinds: Object.values((await chrome.storage.local.get({ attentionMap: {} })).attentionMap || {}).map((entry) => entry.kind) }))()`);
+              const value = result.value || {};
+              if (value.badge || (value.kinds || []).some((kind) => ['working', 'waiting', 'done'].includes(kind))) sawSpuriousDone = true;
+              return Date.now() - at >= duration;
+            }, duration + 1000);
+          };
+          await watchQuiet(1200);
           await page.send('Runtime.evaluate', {
             expression: `(() => { const n = document.getElementById('dshm-test-ongoing'); if (n) n.remove(); return 'removed'; })()`,
             returnByValue: true,
           });
-          const dAttOk = await waitFor(() => attEntryKind('done'), 9000);
-          const dBadgeOk = await waitFor(async () => {
-            const j = await getBadgeJson();
-            return badgeHas(String(j.value || ''), '!', /#22c55e|22c55e|34,\s*197,\s*94/i);
-          }, 4000);
+          await watchQuiet(2200);
           const bDone2 = await getBadgeJson();
-          record('M8：e2e 工作→完成 → 绿「!」（DOM 回退路径；attentionMap 有 done 条目为链路证据）',
-            dAttOk && dBadgeOk,
-            'badge=' + String(bDone2.value || '') + ' base=' + JSON.stringify(base2) + (bDone2.raw ? ' ' + bDone2.raw : ''));
+          record('M8：e2e 摘要不可用时 DOM ongoing→移除不制造工作/完成提醒',
+            !sawSpuriousDone,
+            'badge=' + String(bDone2.value || '') + ' base=' + JSON.stringify(base2));
         }
 
         // —— 收尾：切回 dsh 标签 → clear 恢复，关闭辅助标签 ——
@@ -847,7 +1212,7 @@ async function main() {
     detInfo.injected === true && /刷新页面/.test(detInfo.status || '') && !/dot-error/.test(detInfo.dot || ''),
     JSON.stringify(detInfo));
   await page.send('Page.reload');
-  await sleep(8000);
+  await waitForManagedPanel();
   const rec = await page.send('Runtime.evaluate', {
     expression: `(() => {
       const h = document.getElementById('dsh-manager-panel-host');
@@ -905,11 +1270,12 @@ async function main() {
           const expr = `(() => {
             let err = null;
             try {
+              if (window.__dshManagerPanelInjected !== true || chrome.runtime.id !== ${JSON.stringify(extId)}) return JSON.stringify({ ready: false });
               // 注意：面板监听器挂在 document（capture）——window.dispatchEvent 的传播
               // 路径不经过 document，必须 document.dispatchEvent（2026-08-26 实测破案）。
               document.dispatchEvent(new CustomEvent('__whalekeeper_sse_frame', { detail: { __whalekeeper: true, frame: ${JSON.stringify(frame)} } }));
             } catch (e) { err = String(e && e.stack || e); }
-            return JSON.stringify({ err: err, injected: typeof window.__dshManagerPanelInjected, alive: document.documentElement.getAttribute('data-dshm-sse-alive') });
+            return JSON.stringify({ ready: !err, err: err, injected: typeof window.__dshManagerPanelInjected, alive: document.documentElement.getAttribute('data-dshm-sse-alive') });
           })()`;
           const defaultCtxs = pageCtxInfos.filter((c) => c && c.auxData && c.auxData.isDefault === true);
           const mainFrameId = defaultCtxs.length > 0 ? defaultCtxs[defaultCtxs.length - 1].auxData.frameId : undefined;
@@ -917,6 +1283,8 @@ async function main() {
           for (const c of candidates) {
             try {
               const r = await page.send('Runtime.evaluate', { expression: expr, contextId: c.id, returnByValue: true });
+              const info = JSON.parse(String(r?.result?.value || '{}'));
+              if (info.ready !== true) continue;
               log('M12 dispatch isolated ctx id=' + c.id + ' name=' + (c.name || '?') + ' -> ' + JSON.stringify(r && r.result && r.result.value));
               return r && r.result && r.result.value;
             } catch (_) { /* 该上下文已销毁/不可用：尝试下一个 */ }
@@ -1173,6 +1541,9 @@ async function main() {
     }
   }
 
+  // 8e) rc.2：真实服务端断流/HTTP 回退/隐藏重连。配置 fixture 时必须执行，不能 SKIP。
+  await verifyRealSseRecovery(dshUrl, extId, page, tab.id);
+
   // 9) 日志页交互（安全只读）：点「加载更早」（真实日志 < 500 行 → toast 已到开头）
   //    与「复制全部」（toast 显示行数）——验证按钮/toast 链路，不触碰生命周期。
   log('日志页交互（加载更早 / 复制全部）');
@@ -1285,11 +1656,22 @@ async function main() {
   };
   const gotoPopup = async () => {
     await page.send('Page.navigate', { url: 'chrome-extension://' + extId + '/popup.html' });
-    await sleep(2500);
+    await waitUntil(async () => {
+      const result = await page.send('Runtime.evaluate', {
+        expression: `typeof settings !== 'undefined' && !!settings && typeof pollTimer !== 'undefined' && pollTimer !== null && !!document.getElementById('statuscard')`,
+        returnByValue: true,
+      });
+      return result && result.result && result.result.value === true;
+    }, 8000);
   };
   const gotoDsh = async () => {
     await page.send('Page.navigate', { url: dshUrl });
-    await sleep(8000); // 等 SPA 加载 + content script 注入（与第 6 步同等待窗口）
+    await waitUntil(async () => {
+      const result = await page.send('Runtime.evaluate', {
+        expression: `!!document.getElementById('dsh-manager-panel-host')?.shadowRoot`, returnByValue: true,
+      });
+      return result && result.result && result.result.value === true;
+    }, 10000);
   };
   const shotPng = async (name) => {
     const r = await page.send('Page.captureScreenshot', { format: 'png' });
@@ -1606,35 +1988,127 @@ async function main() {
   record('M7：stopped 状态词「已停止」+ 灰点',
     okv(v.stopped) && v.stopped.word === '已停止' && v.stopped.dot === 'dot dot-stopped', JSON.stringify(v.stopped));
 
-  // M13（§2.1.1 B1）：openWebUI 优先用 detail.launchUrl（含 token，深链 hash 保留），
-  // 无 launchUrl（external/adopted/旧记录）回退裸 URL。stub chrome.tabs.query/create
-  // 捕获新建标签 URL，不真实开标签。
+  // M13/rc.2：只 stub 本段的 tabs/windows 边界，运行真实 openWebUI 实现；
+  // 会话无伪 hash 路由。认证查询只传 type，所有证据只返回布尔值/计数，不返回令牌 URL。
   const m13Open = await evalPage(`(async () => {
-    const origQuery = chrome.tabs.query;
-    const origCreate = chrome.tabs.create;
-    chrome.tabs.query = () => Promise.resolve([]);
-    let captured = null;
-    chrome.tabs.create = (opts) => { captured = opts.url; return Promise.resolve({ id: 1 }); };
-    detail = { port: 3080, launchUrl: 'http://127.0.0.1:3080/?token=abc123' };
-    await openWebUI('/#/chat/xyz');
-    const withLaunch = captured;
-    captured = null;
-    detail = { port: 3080 };
-    await openWebUI('/');
-    const bare = captured;
-    chrome.tabs.query = origQuery;
-    chrome.tabs.create = origCreate;
-    return JSON.stringify({ withLaunch, bare });
+    const original = {
+      query: chrome.tabs.query, create: chrome.tabs.create, update: chrome.tabs.update,
+      reload: chrome.tabs.reload, sendMessage: chrome.tabs.sendMessage,
+      getCurrent: chrome.windows.getCurrent, windowUpdate: chrome.windows.update,
+      detail, state, settings,
+    };
+    const token = 'verify-auth-fixture-token-1234567890';
+    const launch = 'http://127.0.0.1:3080/?token=' + token;
+    let tabs = [], auth = { authenticated: true, port: 3080 }, noReceiver = false;
+    let calls;
+    const resetCalls = () => { calls = { created: [], updated: [], reloaded: [], focused: [], messages: [] }; };
+    const safe = () => ({
+      creates: calls.created.length,
+      legalLaunch: calls.created.length === 1 && calls.created[0].url === launch,
+      cleanBare: calls.created.length === 1 && calls.created[0].url === 'http://127.0.0.1:3080',
+      rootOnly: calls.created.every((entry) => { const u = new URL(entry.url); return u.pathname === '/' && !u.hash; }),
+      noSecret: !JSON.stringify({ updated: calls.updated, messages: calls.messages, focused: calls.focused }).includes(token),
+      updateIds: calls.updated.map((entry) => entry.id),
+      updateOnlyActive: calls.updated.every((entry) => entry.options.active === true && Object.keys(entry.options).length === 1),
+      reloads: calls.reloaded.length,
+      focusIds: calls.focused.map((entry) => entry.id),
+      authQueryOnly: calls.messages.every((entry) => Object.keys(entry.message).length === 1 && entry.message.type === 'dsh-auth-status'),
+      authTopFrame: calls.messages.every((entry) => entry.options && entry.options.frameId === 0),
+      messageIds: calls.messages.map((entry) => entry.id),
+      toast: (document.getElementById('toast-text') || {}).textContent || '',
+    });
+    const invoke = async (input = {}) => {
+      resetCalls();
+      tabs = input.tabs || [];
+      auth = Object.prototype.hasOwnProperty.call(input, 'auth') ? input.auth : { authenticated: true, port: 3080 };
+      noReceiver = input.noReceiver === true;
+      detail = { port: 3080 };
+      if (input.launch !== null) detail.launchUrl = input.launch || launch;
+      state = input.external ? 'external' : 'running';
+      const toast = document.getElementById('toast-text'); if (toast) toast.textContent = '';
+      await openWebUI();
+      return safe();
+    };
+    const existing = { id: 701, windowId: 71, url: 'http://127.0.0.1:3080/', status: 'complete', lastAccessed: 100 };
+    try {
+      settings = Object.assign({}, settings, { port: 3080 });
+      chrome.tabs.query = async () => tabs;
+      chrome.tabs.create = async (options) => { calls.created.push(options); return { id: 799 }; };
+      chrome.tabs.update = async (id, options) => { calls.updated.push({ id, options }); return { id }; };
+      chrome.tabs.reload = async (id) => { calls.reloaded.push(id); };
+      chrome.tabs.sendMessage = async (id, message, options) => {
+        calls.messages.push({ id, message, options });
+        if (noReceiver) throw new Error('fixture: no receiving end');
+        return auth;
+      };
+      chrome.windows.getCurrent = async () => ({ id: 71 });
+      chrome.windows.update = async (id, options) => { calls.focused.push({ id, options }); return { id }; };
+      const out = {};
+      out.withLaunch = await invoke();
+      out.bare = await invoke({ launch: null, external: true });
+      out.authenticated = await invoke({ tabs: [existing] });
+      out.localhost = await invoke({ tabs: [{ ...existing, url: 'http://localhost:3080/' }] });
+      out.unauthenticated = await invoke({ tabs: [existing], auth: { authenticated: false, port: 3080 } });
+      out.unknown = await invoke({ tabs: [existing], auth: { authenticated: null, port: 3080 } });
+      out.noReceiver = await invoke({ tabs: [existing], noReceiver: true });
+      out.discarded = await invoke({ tabs: [{ ...existing, discarded: true }] });
+      out.unloaded = await invoke({ tabs: [{ ...existing, status: 'unloaded' }] });
+      out.authWrongPort = await invoke({ tabs: [existing], auth: { authenticated: true, port: 30801 } });
+      out.wrongPortTab = await invoke({ tabs: [{ ...existing, url: 'http://127.0.0.1:30801/' }] });
+      const invalid = [
+        'https://127.0.0.1:3080/?token=' + token,
+        'http://untrusted.example:3080/?token=' + token,
+        'http://127.0.0.1.evil.example:3080/?token=' + token,
+        'http://127.0.0.1:30801/?token=' + token,
+        'http://127.0.0.1:3080/not-root?token=' + token,
+        'http://user:secret@127.0.0.1:3080/?token=' + token,
+        'http://127.0.0.1:3080/?token=',
+        'http://127.0.0.1:3080/?token=' + token + '&token=other',
+        'http://127.0.0.1:3080/?token=' + token + '&next=https://untrusted.example',
+        'http://127.0.0.1:3080/?token=' + token + '#unsupported',
+        'not a URL',
+      ];
+      out.invalid = [];
+      for (const value of invalid) out.invalid.push(await invoke({ launch: value }));
+      return JSON.stringify(out);
+    } finally {
+      chrome.tabs.query = original.query; chrome.tabs.create = original.create;
+      chrome.tabs.update = original.update; chrome.tabs.reload = original.reload;
+      chrome.tabs.sendMessage = original.sendMessage;
+      chrome.windows.getCurrent = original.getCurrent; chrome.windows.update = original.windowUpdate;
+      detail = original.detail; state = original.state; settings = original.settings;
+    }
   })()`);
   let m13o = {};
   try { m13o = JSON.parse(m13Open); } catch (_) { /* 保持默认 */ }
-  let m13Launch = null;
-  try { m13Launch = new URL(m13o.withLaunch); } catch (_) { /* 保持默认 */ }
-  record('M13：openWebUI 新标签令牌不变且深链 hash 保留',
-    m13Launch?.searchParams.get('token') === 'abc123'
-      && m13Launch.hash === '#/chat/xyz', JSON.stringify(m13o));
-  record('M13：openWebUI 无 launchUrl 时回退裸 URL',
-    m13o.bare === 'http://127.0.0.1:3080', JSON.stringify(m13o));
+  const m13NewOnly = (entry) => !!entry && entry.legalLaunch && entry.rootOnly && entry.noSecret
+    && entry.updateIds.length === 0 && entry.reloads === 0 && entry.focusIds.length === 0;
+  const m13FocusOnly = (entry) => !!entry && entry.creates === 0 && entry.updateOnlyActive
+    && entry.updateIds.length === 1 && entry.updateIds[0] === 701 && entry.reloads === 0
+    && entry.focusIds.length === 1 && entry.focusIds[0] === 71 && entry.noSecret
+    && entry.authQueryOnly && entry.authTopFrame && entry.messageIds.length === 1 && entry.messageIds[0] === 701;
+  record('M13：openWebUI 新标签仅使用合法同端口根启动入口（无伪会话 hash）',
+    m13NewOnly(m13o.withLaunch), JSON.stringify(m13o.withLaunch));
+  record('M13：openWebUI 无 launchUrl 时裸 URL 降级并提示原启动入口',
+    !!m13o.bare && m13o.bare.cleanBare && m13o.bare.noSecret && /原.*启动|启动.*URL|启动.*入口/.test(m13o.bare.toast),
+    JSON.stringify(m13o.bare));
+  record('rc.2 导航：已认证同端口 tab 仅聚焦（只读 auth-status、top frame，无导航/重载）',
+    m13FocusOnly(m13o.authenticated) && m13FocusOnly(m13o.localhost),
+    JSON.stringify({ authenticated: m13o.authenticated, localhost: m13o.localhost }));
+  record('rc.2 导航：401/unknown/no receiver 有合法 token 另开，不覆盖原 tab 草稿',
+    ['unauthenticated', 'unknown', 'noReceiver'].every((key) => m13NewOnly(m13o[key]) && m13o[key].authQueryOnly),
+    JSON.stringify({ unauthenticated: m13o.unauthenticated, unknown: m13o.unknown, noReceiver: m13o.noReceiver }));
+  record('rc.2 导航：discarded/unloaded 与 auth 回错端口均不能冒充已认证',
+    ['discarded', 'unloaded', 'authWrongPort'].every((key) => m13NewOnly(m13o[key])),
+    JSON.stringify({ discarded: m13o.discarded, unloaded: m13o.unloaded, authWrongPort: m13o.authWrongPort }));
+  record('rc.2 导航：3080 不匹配 30801，不向错实例发认证消息',
+    m13NewOnly(m13o.wrongPortTab) && m13o.wrongPortTab.messageIds.length === 0,
+    JSON.stringify(m13o.wrongPortTab));
+  record('rc.2 导航：拒绝外部/错端口/非根/用户密码/畸形 launchUrl，不泄漏 token',
+    Array.isArray(m13o.invalid) && m13o.invalid.length === 11
+      && m13o.invalid.every((entry) => entry.cleanBare && entry.rootOnly && entry.noSecret
+        && !entry.legalLaunch && !/token=|verify-auth-fixture-token/.test(entry.toast)),
+    'invalidCases=' + (m13o.invalid || []).length);
 
   // 深/浅状态卡背景：深色 bg-module-platform（#1e2025 rgb(30, 32, 37)），浅色=bluish-60（#f5f6f7）
   await setPopupTheme('dark');
@@ -1681,6 +2155,11 @@ async function main() {
           title: row.querySelector('.session-title') ? row.querySelector('.session-title').textContent : '',
           state: row.querySelector('.session-state') ? row.querySelector('.session-state').textContent : '',
           dot: dotCls,
+          cursor: getComputedStyle(row).cursor,
+          role: row.getAttribute('role'),
+          tabindex: row.getAttribute('tabindex'),
+          inlineClick: typeof row.onclick === 'function' || row.hasAttribute('onclick'),
+          link: !!row.querySelector('a[href]'),
           dotColor: dot ? getComputedStyle(dot).color : '',
           dotAnim: dot ? getComputedStyle(dot, '::after').animationName : '',
           dotHalo: dot ? getComputedStyle(dot, '::before').animationName : '',
@@ -1707,6 +2186,11 @@ async function main() {
     const out = {};
     const origState = state;
     const origData = sessionsData;
+    const origRefreshSessions = refreshSessions; refreshSessions = () => {};
+    // 仅隔离本静态渲染段：让此前在途 native/mirror 不能覆盖 fixture，真实 SSE 段不受影响。
+    sessionsRevision += 1; sessionsRequestSeq += 1;
+    if (sessionsMirrorTimer) { clearTimeout(sessionsMirrorTimer); sessionsMirrorTimer = null; }
+    sessionsFromMirror = false;
     const origRead = JSON.stringify(readSessions);
     const origRetention = settings ? settings.retentionMins : undefined;
     const NOW = Date.now();
@@ -1733,6 +2217,23 @@ async function main() {
       ],
     };
     render(); await frame(); out.filled = snap();
+    // 会话行是纯展示：dispatch 真 click 并捕获导航边界；只读/撤销按钮另由 M11 覆盖。
+    const originalOpen = openWebUI;
+    const originalCreate = chrome.tabs.create, originalUpdate = chrome.tabs.update;
+    const navigations = [];
+    try {
+      openWebUI = (...args) => { navigations.push({ kind: 'openWebUI', count: args.length }); };
+      chrome.tabs.create = async () => { navigations.push({ kind: 'create' }); return { id: 1 }; };
+      chrome.tabs.update = async () => { navigations.push({ kind: 'update' }); return { id: 1 }; };
+      for (const row of document.querySelectorAll('#sessions-list .session-row')) {
+        row.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+        const title = row.querySelector('.session-title');
+        if (title) title.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+      }
+      out.readOnly = { rows: out.filled.rows.length, navigations: navigations.length };
+    } finally {
+      openWebUI = originalOpen; chrome.tabs.create = originalCreate; chrome.tabs.update = originalUpdate;
+    }
     // 3) 空态（available:true 无会话）
     sessionsData = { available: true, items: [] };
     render(); await frame(); out.empty = snap();
@@ -1741,6 +2242,7 @@ async function main() {
     state = 'running'; render(); await frame(); out.degradeRunning = snap();
     state = 'stopped'; render(); await frame(); out.degradeStopped = snap();
     // 恢复现场
+    refreshSessions = origRefreshSessions;
     sessionsData = origData; state = origState; render();
     readSessions = JSON.parse(origRead);
     if (origRetention === undefined) delete settings.retentionMins; else settings.retentionMins = origRetention;
@@ -1784,6 +2286,11 @@ async function main() {
       && m9.degradeRunning.hintText === '安装/升级 dsh 配套插件后可查看会话'
       && m9ok(m9.degradeStopped) && m9.degradeStopped.hidden === true,
     JSON.stringify(m9.degradeRunning) + ' / ' + JSON.stringify(m9.degradeStopped));
+  record('rc.2 会话只读：行/标题点击不导航，无 pointer/role/tabindex/伪链接（已读撤销保留）',
+    !!m9.readOnly && m9.readOnly.rows === 5 && m9.readOnly.navigations === 0
+      && m9.filled.rows.every((row) => row.cursor !== 'pointer' && row.role === null && row.tabindex === null
+        && row.inlineClick === false && row.link === false),
+    JSON.stringify({ click: m9.readOnly, rows: m9.filled && m9.filled.rows }));
 
   // 14) M10 颜色语义自定义（design §8.12）
   log('M10 颜色角色（§8.12）');
@@ -1804,6 +2311,9 @@ async function main() {
     const out = {};
     const origState = state, origData = sessionsData, origSettings = JSON.stringify(settings);
     const origRefresh = refreshSessions; refreshSessions = () => {};
+    sessionsRevision += 1; sessionsRequestSeq += 1;
+    if (sessionsMirrorTimer) { clearTimeout(sessionsMirrorTimer); sessionsMirrorTimer = null; }
+    sessionsFromMirror = false;
     const NOW = Date.now();
     const MIN = 60000;
     // 基座：三态会话（含 1 idle 验证过滤；排序 M11：待确认 > 进行中 > 已完成）+ running 状态卡
@@ -1929,6 +2439,9 @@ async function main() {
     const origRead = JSON.stringify(readSessions);
     const origRetention = settings ? settings.retentionMins : undefined;
     const origRefreshSessionsRef = refreshSessions; refreshSessions = () => {};
+    sessionsRevision += 1; sessionsRequestSeq += 1;
+    if (sessionsMirrorTimer) { clearTimeout(sessionsMirrorTimer); sessionsMirrorTimer = null; }
+    sessionsFromMirror = false;
     const NOW = Date.now();
     const MIN = 60000;
     readSessions = {};
@@ -2019,21 +2532,40 @@ async function main() {
 }
 
 async function cleanup() {
-  try {
-    if (browserWs && browserWs.ws && browserWs.ws.readyState === 1) {
-      try { await browserWs.send('Browser.close'); } catch (_) { /* 忽略 */ }
-    }
-  } catch (_) { /* 忽略 */ }
-  try {
-    if (chromeProc && chromeProc.pid) {
-      spawnSync('taskkill', ['/PID', String(chromeProc.pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true });
-    }
-  } catch (_) { /* 忽略 */ }
-  try { fs.rmSync(PROFILE, { recursive: true, force: true }); } catch (_) { /* 忽略 */ }
+  if (cleanupPromise) return cleanupPromise;
+  cleanupPromise = (async () => {
+    if (watchdog) { clearTimeout(watchdog); watchdog = null; }
+    try {
+      if (browserWs && browserWs.ws && browserWs.ws.readyState === 1) {
+        await Promise.race([
+          browserWs.send('Browser.close').catch(() => { }),
+          sleep(3000),
+        ]);
+      }
+    } catch (_) { /* 忽略 */ }
+    try {
+      // 只处理本脚本 spawn 且仍未退出的句柄/PID，绝不按进程名或共享调试端口杀浏览器。
+      if (chromeProc && chromeProc.pid && chromeProc.exitCode === null && chromeProc.signalCode === null) {
+        if (process.platform === 'win32') {
+          spawnSync('taskkill', ['/PID', String(chromeProc.pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true, timeout: 3000 });
+        } else {
+          chromeProc.kill('SIGTERM');
+        }
+      }
+    } catch (_) { /* 忽略 */ }
+    try { if (profileOwned) fs.rmSync(PROFILE, { recursive: true, force: true }); } catch (_) { /* Chrome 尚在退场：外层只清本 case profile */ }
+  })();
+  return cleanupPromise;
 }
 
+watchdog = setTimeout(async () => {
+  console.error('[verify-cdp] 总验收截止 225s，关闭本 case Chrome 后失败退出');
+  await cleanup();
+  process.exit(1);
+}, VERIFY_TIMEOUT_MS);
+
 main().catch(async (e) => {
-  console.error('[verify-cdp] 异常: ' + (e && e.stack || e));
+  console.error('[verify-cdp] 异常: ' + redact(e && e.stack || e));
   await cleanup();
   process.exit(1);
 });

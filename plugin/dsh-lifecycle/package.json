@@ -1,6 +1,6 @@
 {
   "name": "dsh-lifecycle",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "description": "DSH lifecycle plugin: graceful shutdown, health, read-only session summary and SSE push endpoints, plus a local readiness signal for Whalekeeper-managed instances.",
   "type": "module",
   "main": "index.js",

@@ -36,6 +36,21 @@
 
 const http = require('http');
 let listeningServer;
+const fakeStartedAt = Date.now();
+// New timing/failure hooks are opt-in and cannot alter a normal fake invocation.
+function testNumber(name, fallback = 0) {
+  if (process.env.DSH_MANAGER_TEST_MODE !== '1') return fallback;
+  const raw = process.env['DSH_FAKE_' + name];
+  if (typeof raw !== 'string' || !/^\d+$/.test(raw)) return fallback;
+  const value = Number(raw);
+  return Number.isSafeInteger(value) && value <= 300000 ? value : fallback;
+}
+const listenDelay = testNumber('LISTEN_DELAY_MS');
+const urlDelay = testNumber('URL_DELAY_MS');
+const httpReadyDelay = testNumber('HTTP_READY_DELAY_MS');
+const readyDelay = testNumber('READY_DELAY_MS');
+const healthFailures = testNumber('HEALTH_FAILURES');
+let healthRequests = 0;
 
 // Match the current launcher's profile/patch boundary for compatibility smoke.
 if (process.env.DSH_FAKE_STRICT_CLI === '1' && !process.argv.includes('--version')) {
@@ -94,7 +109,11 @@ function webUrlLine(actualPort) {
 async function publishReady(actualPort) {
   if (process.env.DSH_FAKE_READY !== '1') return;
   const { publishReadiness } = await import('../../plugin/dsh-lifecycle/readiness.js');
-  const dispose = publishReadiness({ webServer: { port: actualPort }, get: () => undefined });
+  const dispose = publishReadiness({ webServer: { port: actualPort }, effect() {},
+    get: name => name === 'appReady' ? { onReady(callback) {
+      const timer = setTimeout(callback, readyDelay);
+      return () => clearTimeout(timer);
+    } } : undefined });
   process.once('exit', dispose);
 }
 
@@ -104,56 +123,46 @@ if (process.argv.includes('--version')) {
   process.exit(0);
 }
 
-// --port 0（M4 动态端口）：与真实 dsh 一致——绑定后再打印实际端口；
-// 固定端口保持原有「先打印 URL 行再监听」行为。
-// 退出立即变体（--exit-immediately）：不监听，打印 port 0 的 URL 行后退出
-// （宿主日志解析会跳过 port 0 -> 发现失败 -> START_TIMEOUT）。
-if (port === 0 && !exitImmediately) {
-  const server = http.createServer((req, res) => {
-    respond(server.address().port, req, res);
-  });
-  listeningServer = server;
-  server.listen(0, '127.0.0.1', () => {
-    const actual = server.address().port;
-    void publishReady(actual);
-    if (!noUrl) {
-      console.log(webUrlLine(actual));
-      console.log('fake-dsh listening on 127.0.0.1:' + actual);
-    }
-    // noUrl：进程保持存活但不打印 URL（宿主动态端口发现将失败 → 占位期 starting）
-  });
-  return;
+// Fixed ports retain the historical pre-listen URL; dynamic ports print after bind.
+function printUrl(actual) {
+  if (noUrl) return;
+  if (urlDelay > 0) setTimeout(() => console.log(webUrlLine(actual)), urlDelay);
+  else console.log(webUrlLine(actual));
 }
-
-console.log(webUrlLine(port));
-
+if (port > 0 || exitImmediately) printUrl(port);
 if (exitImmediately) {
   console.log('FAKE-EXIT-IMMEDIATELY: 不启动 HTTP 服务，200ms 后退出');
   setTimeout(() => process.exit(0), 200);
-  return; // 仅保持进程存活 200ms
+  return;
 }
-
-const server = http.createServer((req, res) => {
-  respond(port, req, res);
-});
+const server = http.createServer((req, res) => respond(server.address().port, req, res));
 listeningServer = server;
-
-server.listen(port, '127.0.0.1', () => {
-  void publishReady(port);
-  console.log('fake-dsh listening on 127.0.0.1:' + port);
+const listen = () => server.listen(port, '127.0.0.1', () => {
+  const actual = server.address().port;
+  void publishReady(actual);
+  if (port === 0) printUrl(actual);
+  if (!noUrl) console.log('fake-dsh listening on 127.0.0.1:' + actual);
 });
+if (listenDelay > 0) setTimeout(listen, listenDelay);
+else listen();
 
 // 统一路由（M2：health/shutdown 供宿主优雅路径探测；SPA 200 兜底）
 function respond(actualPort, req, res) {
   if (logHeaders) {
     console.log(`FAKE-REQ ${req.method} ${req.url} ae=${req.headers['accept-encoding'] ?? 'ABSENT'}`);
   }
-  if (process.env.DSH_FAKE_READY === '1' && req.url === '/') {
+  if ((process.env.DSH_FAKE_READY === '1' || Date.now() - fakeStartedAt < httpReadyDelay) && req.url === '/') {
     res.writeHead(503);
     res.end('HTTP readiness deliberately unavailable');
     return;
   }
   if (!noLifecycle && req.method === 'GET' && req.url === '/_lifecycle/health') {
+    if (healthRequests++ < healthFailures) {
+      console.log('HEALTH-TRANSIENT-FAILURE');
+      res.writeHead(503);
+      res.end('transient health failure');
+      return;
+    }
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end(JSON.stringify({
       ok: true,
@@ -168,8 +177,10 @@ function respond(actualPort, req, res) {
     console.log('SHUTDOWN-RECEIVED');
     res.writeHead(202, { 'content-type': 'application/json' });
     res.end(JSON.stringify({ ok: true }));
-    const exitDelay = Number(process.env.DSH_FAKE_EXIT_DELAY_MS) || 100;
-    if (exitDelay > 100) listeningServer.close();
+    const exitDelay = Number(process.env.DSH_FAKE_EXIT_DELAY_MS) || 100; // Existing hook remains compatible.
+    const closeDelay = testNumber('CLOSE_DELAY_MS');
+    if (closeDelay > 0) setTimeout(() => listeningServer.close(), closeDelay);
+    else if (exitDelay > 100) listeningServer.close();
     setTimeout(() => process.exit(0), exitDelay);
     return;
   }

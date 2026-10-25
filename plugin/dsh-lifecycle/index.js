@@ -19,15 +19,10 @@
 // The webserver dispatches `await route.handler(req, res)`; a handled exact
 // route answers before the SPA fallback, so these paths never hit `/api`.
 
-import { publishReadiness } from './readiness.js'
+import { createResourceScope, publishReadiness } from './readiness.js'
 
 export const name = 'dsh-lifecycle'
 export const inject = ['webServer', 'appExit']
-
-// Idempotency guard: once a shutdown has been requested, subsequent POSTs are
-// answered 409 Conflict without calling appExit again. This is self-managed and
-// does NOT rely on the upstream `createProcessShutdown` pending-merge behavior.
-let exiting = false
 
 const isLoopback = (addr) => addr === '127.0.0.1' || addr === '::1' || addr === '::ffff:127.0.0.1'
 
@@ -148,14 +143,9 @@ function hasPendingInteraction(events) {
   return false
 }
 
-// Active subagent children of ONE parent session, folded from the parent's own
-// event stream. The official subagent seam publishes `subagent/start` /
-// `subagent/end` (same runId) INTO the parent session's log (dsh-subagent
-// lifecycle emitter keyed by the delegating parent), so pairing runIds is the
-// authoritative lifetime signal — it survives cold-resume (a fresh epoch
-// publishes fresh edges), covers descendant chains (a child's `end` fires only
-// after all of its own descendants settled), and needs no agents-service
-// polling.
+// Compatibility fallback for old/test session logs containing run edges. Real
+// dsh publishes these on the event bus, not the log; the live index below is
+// authoritative and this fold must not replace its lifecycle ownership.
 function activeChildIds(events) {
   const started = new Map() // runId -> child session id
   const ended = new Set() // runIds that settled
@@ -210,16 +200,13 @@ function removeChildFromActive(activeByParent, parentId, childId) {
   if (byRun.size === 0) activeByParent.delete(parentId)
 }
 
-function activeChildRuns(parentId, sessions, agents, childLabelBy, activeByParent) {
+function activeChildRuns(parentId, sessions, agents, childLabelBy, activeByParent, events = sessionEvents(sessions?.get?.(parentId))) {
   const ids = new Set()
   const byRun = activeByParent.get(parentId)
   if (byRun !== undefined) {
     for (const childId of byRun.values()) ids.add(childId)
   }
-  const session = sessions?.get?.(parentId)
-  if (session !== undefined) {
-    for (const childId of activeChildIds(sessionEvents(session))) ids.add(childId)
-  }
+  for (const childId of activeChildIds(events)) ids.add(childId)
   if (ids.size === 0 && sessions?.list) {
     for (const s of sessions.list()) {
       if (s && s.header?.origin === 'subagent'
@@ -253,8 +240,7 @@ function foldChildLabel(events) {
 // (docs/design.md §8.10): waiting > working > completed > idle.
 // `childRuns` is computed by the caller via activeChildRuns() (M13.1: the
 // event-bus index is the authoritative source; see note above).
-function summarizeSession(session, agents, childRuns) {
-  const events = sessionEvents(session)
+function summarizeSession(session, agents, childRuns, events = sessionEvents(session)) {
   const running = agents?.get?.(session.id)?.status === 'running'
   let state = 'idle'
   if (hasPendingInteraction(events)) state = 'waiting'
@@ -311,8 +297,9 @@ function buildItems(ctx, sessions, agents, activeByParent) {
     if (!session || typeof session !== 'object') continue
     if (session.header?.origin === 'subagent') continue
     try {
-      const childRuns = activeChildRuns(session.id, sessions, agents, childLabelBy, activeByParent)
-      const summary = summarizeSession(session, agents, childRuns)
+      const events = sessionEvents(session)
+      const childRuns = activeChildRuns(session.id, sessions, agents, childLabelBy, activeByParent, events)
+      const summary = summarizeSession(session, agents, childRuns, events)
       if (archivedIds !== null && archivedIds.has(session.id) && summary.childRuns.length === 0) continue
       items.push(summary)
     } catch {
@@ -350,86 +337,120 @@ const RELEVANT_EVENT_TYPES = new Set([
 ])
 
 export function apply(ctx) {
-  // A fresh lifecycle per mount: reset the idempotency guard when the plugin
-  // is (re)applied, so a disposed/remounted instance starts clean.
-  exiting = false
-  const connections = new Set()
-  const summaryBy = new Map()
-  const pending = new Map()
-  let frameId = 0
-
-  // M13.1 子代理活跃索引（权威源 = 事件总线；见 activeChildRuns 注记）：
-  //   childParentBy  childId → parentId（session/created 的 header.parentSession）
-  //   activeByParent parentId → Map<runId, childId>（subagent/start|end 总线事件）
-  // 无条件维护（不 gate 在 connections.size 上——索引是状态，不是推送）。
+  // Cordis constructs ordinary apply functions and does not collect their
+  // return value. The mount effect must own cleanup before any acquisition.
+  const scope = createResourceScope(ctx, 'dsh-lifecycle')
+  const connections = new Map() // response -> idempotent release
+  const summaryBy = new Map() // last state delivered to all current clients
+  const pending = new Map() // session id -> debounce release
   const childParentBy = new Map()
   const activeByParent = new Map()
+  let exiting = false // private to this mount, never shared with another one
+  let frameId = 0
 
+  scope.add(() => {
+    connections.clear()
+    summaryBy.clear()
+    pending.clear()
+    childParentBy.clear()
+    activeByParent.clear()
+  })
   const sseFrame = (event, data) => {
     frameId += 1
     return `id: ${frameId}\nevent: ${event}\ndata: ${JSON.stringify(data)}\n\n`
   }
-  const broadcast = (event, data) => {
-    if (connections.size === 0) return
-    const line = sseFrame(event, data)
-    for (const res of connections) {
-      if (res.writableEnded || res.destroyed) { connections.delete(res); continue }
-      try { res.write(line) } catch { connections.delete(res) }
+  function writeAll(line) {
+    for (const [res, release] of connections) {
+      if (res.writableEnded || res.destroyed) { release(); continue }
+      try { res.write(line) } catch { release() }
     }
   }
+  function broadcast(event, data) {
+    if (scope.disposed || connections.size === 0) return
+    writeAll(sseFrame(event, data))
+  }
+  function removed(sessionId) {
+    if (!summaryBy.delete(sessionId)) return
+    broadcast('removed', { sessionId })
+  }
+  function upsert(summary) {
+    const prev = summaryBy.get(summary.sessionId)
+    if (prev !== undefined && summariesEqual(prev, summary)) return
+    summaryBy.set(summary.sessionId, summary)
+    broadcast('upsert', { session: summary })
+  }
 
-  // Recompute one live session's summary and push on semantic change only.
-  // Mirrors GET /_manager/sessions exactly: subagent origin yields no row;
-  // archived sessions without running children are omitted (a row that becomes
-  // archived is broadcast as `removed` — the GET surface simply omits it).
+  // Mirrors GET: child sessions never get rows and archived parents disappear
+  // only after their active children settle. No clients means no derivation.
   function recompute(sessionId) {
+    if (scope.disposed || connections.size === 0) return
     const sessions = ctx.get('sessions')
     if (sessions === undefined) return
     const session = sessions.get?.(sessionId)
-    if (session === undefined || session === null) return
+    if (session === undefined || session === null) { removed(sessionId); return }
     if (session.header?.origin === 'subagent') return
     const agents = ctx.get('agents')
     let summary
     try {
-      const childRuns = activeChildRuns(sessionId, sessions, agents, buildChildLabelMap(sessions.list()), activeByParent)
-      summary = summarizeSession(session, agents, childRuns)
+      const events = sessionEvents(session)
+      const childRuns = activeChildRuns(sessionId, sessions, agents, buildChildLabelMap(sessions.list()), activeByParent, events)
+      summary = summarizeSession(session, agents, childRuns, events)
     } catch {
       return
     }
     const archivedIds = archivedSessionIds(ctx)
-    if (archivedIds !== null && archivedIds.has(sessionId) && summary.childRuns.length === 0) {
-      if (summaryBy.has(sessionId)) {
-        summaryBy.delete(sessionId)
-        broadcast('removed', { sessionId })
-      }
-      return
-    }
-    const prev = summaryBy.get(sessionId)
-    if (prev !== undefined && summariesEqual(prev, summary)) return
-    summaryBy.set(sessionId, summary)
-    broadcast('upsert', { session: summary })
+    if (archivedIds?.has(sessionId) && summary.childRuns.length === 0) removed(sessionId)
+    else upsert(summary)
   }
-
   function scheduleRecompute(sessionId) {
-    if (pending.has(sessionId)) return
-    pending.set(sessionId, setTimeout(() => {
+    if (scope.disposed || connections.size === 0 || pending.has(sessionId)) return
+    let timer
+    const release = scope.add(() => {
+      if (timer !== undefined) clearTimeout(timer)
       pending.delete(sessionId)
-      recompute(sessionId)
-    }, 50))
+    })
+    pending.set(sessionId, release)
+    try {
+      timer = setTimeout(() => { release(); recompute(sessionId) }, 50)
+      timer.unref?.()
+    } catch (error) { release(); throw error }
+  }
+  function clearPending() {
+    for (const release of pending.values()) release()
   }
 
-  // Heartbeat: keeps proxies/NAT from idling the stream closed; unref'd so a
-  // disposed plugin never holds the process open.
-  const heartbeat = setInterval(() => {
-    for (const res of connections) {
-      if (res.writableEnded || res.destroyed) { connections.delete(res); continue }
-      try { res.write(': ping\n\n') } catch { connections.delete(res) }
+  // One current snapshot is used BOTH for catching existing clients up and
+  // initializing the newcomer. Never silently advance the global baseline.
+  function synchronizeSnapshot(items) {
+    clearPending()
+    const next = new Map(items.map(item => [item.sessionId, item]))
+    if (connections.size > 0) {
+      for (const id of [...summaryBy.keys()]) if (!next.has(id)) removed(id)
+      for (const item of items) upsert(item)
     }
-  }, 15000)
-  heartbeat.unref()
+    summaryBy.clear()
+    for (const [id, item] of next) summaryBy.set(id, item)
+  }
+  function register(spec) {
+    scope.acquire(() => ctx.webServer.register(spec))
+  }
+  function listen(event, callback) {
+    scope.acquire(() => ctx.on(event, (...args) => {
+      if (!scope.disposed) callback(...args)
+    }))
+  }
 
-  const dispose = [
-    ctx.webServer.register({
+  try {
+    // Heartbeat and every dynamically created timeout/socket use the same
+    // resource stack. Completed resources detach instead of accumulating.
+    let heartbeat
+    scope.add(() => { if (heartbeat !== undefined) clearInterval(heartbeat) })
+    heartbeat = setInterval(() => {
+      if (!scope.disposed) writeAll(': ping\n\n')
+    }, 15000)
+    heartbeat.unref()
+
+    register({
       kind: 'exact',
       path: '/_lifecycle/health',
       handler: async (req, res) => {
@@ -443,27 +464,39 @@ export function apply(ctx) {
           nodeVersion: process.version,
         }))
       },
-    }),
-    ctx.webServer.register({
+    })
+    register({
       kind: 'exact',
       path: '/_lifecycle/shutdown',
       handler: async (req, res) => {
-        if (!routeGuard(req, res, 'POST')) return
+        if (!routeGuard(req, res, 'POST') || scope.disposed) return
         if (exiting) {
           res.writeHead(409, { 'content-type': 'application/json' })
           res.end(JSON.stringify({ ok: false, error: 'shutdown already in progress' }))
           return
         }
         exiting = true
-        // Flush the 202 response before beginning dispose, so the ack reaches
-        // the socket rather than being truncated by process teardown.
-        res.writeHead(202, { 'content-type': 'application/json' })
-        res.end(JSON.stringify({ ok: true }), () => {
-          setImmediate(() => ctx.appExit(0))
+        // The response must flush before shutdown, but disposal can win that
+        // race. Own the callback before res.end and cancel the queued immediate.
+        let immediate
+        let flushed = false
+        const cancelExit = scope.add(() => {
+          if (immediate !== undefined) clearImmediate(immediate)
         })
+        try {
+          res.writeHead(202, { 'content-type': 'application/json' })
+          res.end(JSON.stringify({ ok: true }), () => {
+            if (scope.disposed || flushed) return
+            flushed = true
+            immediate = setImmediate(() => {
+              cancelExit()
+              if (!scope.disposed) ctx.appExit(0)
+            })
+          })
+        } catch (error) { cancelExit(); throw error }
       },
-    }),
-    ctx.webServer.register({
+    })
+    register({
       kind: 'exact',
       path: '/_manager/sessions',
       handler: async (req, res) => {
@@ -474,111 +507,100 @@ export function apply(ctx) {
           res.end(JSON.stringify({ ok: false, error: 'sessions service unavailable' }))
           return
         }
-        const agents = ctx.get('agents')
-        const items = buildItems(ctx, sessions, agents, activeByParent)
+        const items = buildItems(ctx, sessions, ctx.get('agents'), activeByParent)
         res.writeHead(200, { 'content-type': 'application/json' })
         res.end(JSON.stringify({ ok: true, items }))
       },
-    }),
-    ctx.webServer.register({
+    })
+    register({
       kind: 'exact',
       path: '/_manager/events',
       handler: (req, res) => {
-        if (!routeGuard(req, res, 'GET')) return
+        if (!routeGuard(req, res, 'GET') || scope.disposed) return
         const sessions = ctx.get('sessions')
         if (sessions === undefined) {
           res.writeHead(500, { 'content-type': 'application/json' })
           res.end(JSON.stringify({ ok: false, error: 'sessions service unavailable' }))
           return
         }
-        // SSE handshake: snapshot first, then deltas. Reconnect semantics are
-        // deliberately snapshot-based (no Last-Event-ID replay) — the client
-        // rebuilds its view from the snapshot frame and applies deltas on top.
-        res.writeHead(200, {
-          'content-type': 'text/event-stream',
-          'cache-control': 'no-cache',
-          'connection': 'keep-alive',
-        })
-        res.write('retry: 3000\n\n')
-        let items = []
-        try {
-          items = buildItems(ctx, sessions, ctx.get('agents'), activeByParent)
-        } catch {
-          items = []
-        }
-        res.write(sseFrame('snapshot', { ok: true, items }))
-        for (const it of items) summaryBy.set(it.sessionId, it)
-        connections.add(res)
-        res.on('close', () => {
+        // Prune dead responses even if their close notification was missed.
+        for (const [old, release] of connections) if (old.writableEnded || old.destroyed) release()
+        const onClose = () => release()
+        const release = scope.add(() => {
           connections.delete(res)
+          try {
+            if (typeof res.off === 'function') res.off('close', onClose)
+            else res.removeListener?.('close', onClose)
+          } finally {
+            try { if (!res.writableEnded && !res.destroyed) res.end() } finally {
+              if (connections.size === 0) { clearPending(); summaryBy.clear() }
+            }
+          }
         })
+        try {
+          res.on('close', onClose)
+          res.writeHead(200, {
+            'content-type': 'text/event-stream',
+            'cache-control': 'no-cache',
+            'connection': 'keep-alive',
+          })
+          res.write('retry: 3000\n\n')
+          let items
+          try { items = buildItems(ctx, sessions, ctx.get('agents'), activeByParent) } catch { items = [] }
+          synchronizeSnapshot(items)
+          res.write(sseFrame('snapshot', { ok: true, items }))
+          if (res.writableEnded || res.destroyed) release()
+          else connections.set(res, release)
+        } catch (error) { release(); throw error }
       },
-    }),
-    // M12 event-driven push surface: the Cordis firehose (app-level listeners
-    // receive every session's events — dsh-scope upward-flow semantics, same
-    // pattern the official apiproxy uses). All callbacks are guarded by
-    // `connections.size === 0`, so zero SSE clients means zero work.
-    ctx.on('session/created', (session) => {
-      if (connections.size === 0) return
+    })
+
+    // Index maintenance is unconditional; summary derivation is client-gated.
+    // Merge dispose handling so index removal ALWAYS precedes parent recompute.
+    listen('session/created', (session) => {
       const id = session?.id
       if (typeof id !== 'string') return
-      recompute(id)
-    }),
-    ctx.on('session/disposed', (session) => {
-      if (connections.size === 0) return
+      if (session.header?.origin === 'subagent') {
+        const parentId = session.header.parentSession
+        if (typeof parentId === 'string') childParentBy.set(id, parentId)
+      } else recompute(id)
+    })
+    listen('session/disposed', (session) => {
       const id = session?.id
       if (typeof id !== 'string') return
-      if (summaryBy.has(id)) {
-        summaryBy.delete(id)
-        broadcast('removed', { sessionId: id })
-      }
-      // A disposed subagent can also change its parent's childRuns — re-check
-      // every live row (few dozen at most; diff suppresses no-ops).
-      for (const sid of [...summaryBy.keys()]) recompute(sid)
-    }),
-    ctx.on('session/event', (session, event) => {
+      const parentId = childParentBy.get(id) ?? session.header?.parentSession
+      childParentBy.delete(id)
+      if (typeof parentId === 'string') removeChildFromActive(activeByParent, parentId, id)
+      activeByParent.delete(id)
+      for (const [childId, parent] of childParentBy) if (parent === id) childParentBy.delete(childId)
+      pending.get(id)?.()
+      if (connections.size === 0) return
+      removed(id)
+      if (typeof parentId === 'string') recompute(parentId)
+    })
+    listen('session/event', (session, event) => {
       if (connections.size === 0) return
       const type = event?.type
       if (type === 'tool/call') {
-        // M12.1：exit_plan_mode（计划审查）与 ask_user_question 同属「等待用户」工具
         if (event?.data?.name !== 'ask_user_question' && event?.data?.name !== 'exit_plan_mode') return
-      } else if (!RELEVANT_EVENT_TYPES.has(type)) {
-        return
-      }
+      } else if (!RELEVANT_EVENT_TYPES.has(type)) return
       const id = session?.id
       if (typeof id !== 'string') return
-      scheduleRecompute(id)
-    }),
-    ctx.on('agent/status', (payload) => {
+      scheduleRecompute(session.header?.origin === 'subagent'
+        ? childParentBy.get(id) ?? session.header.parentSession ?? id : id)
+    })
+    listen('agent/status', (payload) => {
       if (connections.size === 0) return
       const id = payload?.agent?.id
       if (typeof id !== 'string') return
-      recompute(id)
-    }),
-    // M13.1 子代理活跃索引（无条件维护——索引是状态，不是推送，不 gate 在
-    // connections.size 上）：session/created 登记 childId → parentId；
-    // subagent/start|end 按 runId 配对维护 activeByParent；dispose 清理。
-    // parentId 缺失时经 liveParentOf 反查（插件热重载后 session/created
-    // 可能已错过；子会话 header.parentSession 是权威关联）。
-    ctx.on('session/created', (session) => {
-      if (session?.header?.origin !== 'subagent') return
-      const parentId = session.header.parentSession
-      if (typeof parentId === 'string' && typeof session.id === 'string') {
-        childParentBy.set(session.id, parentId)
-      }
-    }),
-    ctx.on('session/disposed', (session) => {
-      if (session?.header?.origin !== 'subagent') return
-      const parentId = childParentBy.get(session.id)
-      childParentBy.delete(session.id)
-      if (parentId !== undefined) removeChildFromActive(activeByParent, parentId, session.id)
-    }),
-    ctx.on('subagent/start', (info) => {
+      recompute(childParentBy.get(id) ?? liveParentOf(ctx.get('sessions'), id) ?? id)
+    })
+    listen('subagent/start', (info) => {
       const childId = info?.id
       if (typeof childId !== 'string') return
       const parentId = childParentBy.get(childId) ?? liveParentOf(ctx.get('sessions'), childId)
       if (parentId === undefined) return
-      childParentBy.set(childId, parentId) // 供 end/dispose 清理复用
+      childParentBy.set(childId, parentId)
       if (typeof info?.runId === 'string') {
         let byRun = activeByParent.get(parentId)
         if (byRun === undefined) {
@@ -587,13 +609,13 @@ export function apply(ctx) {
         }
         byRun.set(info.runId, childId)
       }
-      if (connections.size > 0) recompute(parentId)
-    }),
-    ctx.on('subagent/end', (info) => {
+      recompute(parentId)
+    })
+    listen('subagent/end', (info) => {
       const childId = info?.id
       if (typeof childId !== 'string') return
       const parentId = childParentBy.get(childId) ?? liveParentOf(ctx.get('sessions'), childId)
-      if (parentId === undefined) return
+      if (parentId === undefined) return // already disposed: late end is a no-op
       if (typeof info?.runId === 'string') {
         const byRun = activeByParent.get(parentId)
         if (byRun !== undefined) {
@@ -601,23 +623,12 @@ export function apply(ctx) {
           if (byRun.size === 0) activeByParent.delete(parentId)
         }
       }
-      if (connections.size > 0) recompute(parentId)
-    }),
-    () => {
-      clearInterval(heartbeat)
-      for (const t of pending.values()) clearTimeout(t)
-      pending.clear()
-      for (const res of connections) {
-        try { res.end() } catch { /* socket already gone */ }
-      }
-      connections.clear()
-    },
-  ]
-
-  const disposeReadiness = publishReadiness(ctx)
-  ctx.effect(() => disposeReadiness)
-  return () => {
-    disposeReadiness()
-    for (const d of dispose) d()
+      recompute(parentId)
+    })
+    publishReadiness(ctx, process.env, scope)
+  } catch (error) {
+    scope.cleanup() // partial mounts roll back too; preserve the setup error
+    throw error
   }
+  return scope.cleanup // also supports direct callers; effect owns runtime use
 }

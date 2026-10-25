@@ -36,18 +36,18 @@
 
 ```powershell
 node --check native-host/host.js                     # 宿主语法检查
-node native-host/test/smoke.js                       # 冒烟测试 32 场景（全模拟，无前置）
+node native-host/test/smoke.js                       # 冒烟测试 33 场景（全模拟，无前置）
 node native-host/test/smoke-real.js                  # 真实 dsh 集成（需 DSH_MANAGER_NPM_PREFIX=%APPDATA%\npm）
 node native-host/test/e2e-m9-manager.js              # M9 真实实例 e2e（真实 profile 插件装配；需 danger-full-access）
 node native-host/test/e2e-rc1-isolated.js            # M13 真实 rc.1 隔离 e2e（临时前缀；见下）
 node native-host/test/e2e-current-isolated.js        # DSH_MANAGER_VERIFY_UI=1 时含浏览器
-node --test "plugin\dsh-lifecycle\test\*.test.js"    # dsh-lifecycle 插件单测（69 项）
-node --test native-host/test/readiness.test.js       # 就绪文件校验（4 项）
-node --test native-host/test/stop.test.js            # 端口先关/PID 后退出与强制清理（3 项）
+node --test "plugin\dsh-lifecycle\test\*.test.js"    # 插件单测 87 项（含真实 Cordis）
+node --test native-host/test/*.test.js              # 宿主单测 29 项（含 stdio/实际 fake）
+node --test extension/test/*.test.cjs               # 扩展回归 62 项（含后台预算）
 powershell -ExecutionPolicy Bypass -File native-host\install.ps1 -DryRun   # 安装预演（Windows）
 sh native-host/install.sh --dry-run                                          # 安装预演（Linux/macOS）
 powershell -ExecutionPolicy Bypass -File tools\linux\verify-linux.ps1 -E2E  # WSL Linux 冒烟 + 真实安装 E2E
-node tools/verify-ui/verify-cdp.js                   # 扩展 UI 自动验收 108 断言
+node tools/verify-ui/verify-cdp.js                   # 121 断言（正式真实恢复需隔离fixture）
 node tools/verify-ui/verify-ui.js --list             # MCP 路径诊断（chrome-devtools-mcp，需沙箱外）
 ```
 
@@ -59,13 +59,13 @@ node tools/verify-ui/verify-ui.js --list             # MCP 路径诊断（chrome
 
 | 测试 | 口径 | 运行前提 |
 |---|---|---|
-| `smoke.js` | 32 场景；Windows 412 PASS + 1 SKIP（场景 26 POSIX 专属） | 无（fake-dsh 全模拟；BASE_ENV 进程枚举围栏仅 Windows） |
+| `smoke.js` | 33 场景；Windows 428 PASS + 1 SKIP（场景 26 POSIX 专属），2026-10-19 | 无（fake-dsh 全模拟；BASE_ENV 进程枚举围栏仅 Windows） |
 | `smoke-real.js` | 真实 dsh 全链路（start→status→stop + `--port 0`） | `DSH_MANAGER_NPM_PREFIX=%APPDATA%\npm` |
 | `e2e-m9-manager.js` | 7/7 | 真实 profile 插件装配；插件未升级时 SKIP；需 danger-full-access |
 | `e2e-rc1-isolated.js` | 14/14 | 隔离 DSH_HOME + rc.1（缺省 `%TEMP%\dsh-rc1-prefix`，`DSH_MANAGER_NPM_PREFIX` 可覆盖）+ 本地插件方式 B |
-| `e2e-current-isolated.js` | 26/26（含 UI）；dsh 0.2.0-rc.2 | 隔离 DSH_HOME + 官方 CLI 安装插件；`DSH_MANAGER_VERIFY_UI=1` 含浏览器；`DSH_MANAGER_NPM_PREFIX` 选 CLI 安装 |
-| `lifecycle.test.js` + `readiness.test.js` + `stop.test.js` | 插件 69 项、宿主 7 项 | `node --test` |
-| `verify-cdp.js` | 108 断言 | headless Chrome（沙箱拦 mojo 管道时需 danger-full-access 侧挂）；默认 dsh URL 3080（`VERIFY_DSH_URL` 覆盖） |
+| `e2e-current-isolated.js` | dsh 0.2.1-rc.2 三轮196/196，首轮含浏览器121/121，2026-10-19 | 隔离HOME/base/Chrome；`DSH_MANAGER_E2E_ROUNDS=3`、`DSH_MANAGER_VERIFY_UI=1`；默认精确EXPECT_DSH_VERSION=0.2.1-rc.2 |
+| `plugin/dsh-lifecycle/test` + `native-host/test/*.test.js` + `extension/test` | 插件 87、宿主 29、扩展 62，共 178 PASS，0 SKIP，2026-10-19 | `node --test`，真实 Cordis 从所选 npm CLI 解析 |
+| `verify-cdp.js` | 121/121，Chrome155，2026-10-19 | `VERIFY_DSH_URL` 覆盖目标，正式E2E提供同case fixture；缺fixture仅真实恢复段明确SKIP |
 
 > **verify-cdp 覆盖（M13 起）**：真实 rc.1 实例认证引导（探测 401 → 读 run 记录
 > launchUrl → token 兑换 cookie）；popup/logs/面板注入与展开；面板停止两步确认态；
@@ -75,17 +75,21 @@ node tools/verify-ui/verify-ui.js --list             # MCP 路径诊断（chrome
 > 主题与深色（面板跟随、storage 镜像、四态 + Emulation 模拟、无新增 console 异常）；
 > M7 状态卡；M9 会话区（四态/子代理/空态/降级）；M10 颜色角色（改色/恢复/撞色）；
 > M11（仅新鲜完成、已读与 3s 撤销、retentionMins=0 恒显）；M13（openWebUI 有 launchUrl
-> 用 launchUrl（深链 hash 保留）/无则回退裸 URL）；console 异常检查。
+> 用经校验的根 launchUrl / 无则裸 URL 并提示）；rc.2 增加只读行、安全认证聚焦及真实
+> 断流→HTTP→持续 hidden 重连→completed 的 HTTP/镜像一致性。console 异常检查。
 
 ## 环境事实
+
+- 2026-10-18 核验：全局 npm CLI 与 Desktop 运行时均为 **0.2.1-rc.2**，Node
+  **v24.19.0**；`D:\deepseek-harness` 旧源码 checkout 为 0.2.0-rc.2，不可当作新版源码。
 
 - 2026-10-04 实测：Node **v24.19.0**；dsh **0.2.0-rc.2** 全局与源码安装，npm
   `latest` / `next` = rc.2、`alpha` = `0.2.1-alpha.1`；默认端口 3080。
   dsh 0.2.x 要求 Node 22.19+（22.x）或 24+。
 - **上游 dsh 版本跟踪**：破坏性变更集中登记于 design §2.1 台账，版本跳变先查此表。
   **M13 二期已实现**：插件主动报告就绪/端口（§6.9），新鲜文件优先、HTTP 回退。
-  当前配套插件为 0.4.1；本机已同步 5 个发行文件并保留 0.4.0 备份，现有服务未重启。
-  下次启动加载新版本，profile 与宿主注册信息不变。
+  工作区配套插件 0.4.2 已通过本轮隔离验收；日常 profile 仍为此前安装版本，本次不自动
+  同步或重启。旧的 0.4.1 生产同步/备份记录属于 2026-10-04，不代表本次已部署。
 - 约束：**任何 dsh HTTP 探测一律不发 `Accept-Encoding`**（0.1.2 起 webserver 默认 gzip）
 - 宿主安装位置 Windows `%LOCALAPPDATA%\dsh-manager\host\`（host.cmd 内是绝对路径，
   **项目移动必须重跑 install.ps1**）；注册表 HKCU：Chrome/Edge/Firefox 的
@@ -98,6 +102,22 @@ node tools/verify-ui/verify-ui.js --list             # MCP 路径诊断（chrome
   仅当 `DSH_MANAGER_TEST_MODE=1` 时生效
 
 ## 当前状态
+
+- **0.2.1-rc.2 修复验收完成（2026-10-19，台账 §2.1.3）**：工作区扩展 0.3.2、插件
+  0.4.2；150 秒共享启动预算、SW start/restart/stop=210/240/60 秒，统一退出等待，
+  Cordis 全资源 effect 清理，SSE 多客户端/子代理一致性及可见/隐藏恢复，安全入口与
+  会话行只读。2026-10-19 单测178/178、smoke428 PASS/0 FAIL/1 POSIX SKIP、
+  三轮生产源码隔离E2E196/196、其中首轮Chrome155浏览器121/121全部通过。
+  共12次launch，固定/动态各含start/restart/严格graceful stop，PID/监听/run/ready/lock
+  全清且无紧急force。证据根`.e2e-current/run-mvec4ykk-17c724ee/`；真实断流撤销live
+  122ms、hidden重连13737ms、HTTP/SSE/镜像一致无假完成。源码SHA与三轮报告一致。
+  本次不部署日常 profile、不动注册信息或重启当前服务，不提交/发布。
+  新测试入口：`node --test extension/test/*.test.cjs`、
+  `node --test plugin/dsh-lifecycle/test/*.test.js native-host/test/*.test.js`；
+  三轮隔离使用 `DSH_MANAGER_E2E_ROUNDS=3`、`DSH_MANAGER_VERIFY_UI=1` 和
+  `EXPECT_DSH_VERSION=0.2.1-rc.2`。Windows隔离HOME需建立AppData/Local和Roaming，
+  保持短case/独立全新Chrome profile，不关闭Chrome默认目录安全检查；初次缺Local导致
+  CDP拒启已由单变量实测定位并修复。不要运行旧诊断副本来代替正式验收。
 
 - **0.2.x 兼容完成（2026-10-04，台账 §2.1.2）**：修复 NPX 重复 profile 和三种
   启动模式的 patch 参数顺序；插件 0.4.1 放宽至 `<0.3.0-0`，通过官方版本检查，

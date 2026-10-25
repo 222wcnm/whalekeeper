@@ -18,6 +18,25 @@ function parse(signal, overrides = {}, want = expected, skipPidCommandCheck = fa
     pidAlive: () => true, pidLooksLikeDsh: () => true, ...overrides };
   return vm.runInNewContext(parser + '\nreadReadiness', context)(want, skipPidCommandCheck);
 }
+function clean(signal, want = expected) {
+  let removed = false;
+  const start = source.indexOf('function removeOwnedReadiness(');
+  assert.ok(start >= 0, 'host owns identity-aware forced-exit lease cleanup');
+  const cleanup = source.slice(start, source.indexOf('function readinessEnv(', start));
+  const context = { READY_FILE: 'owned-path', log() {},
+    fs: { statSync: () => ({ size: 256 }), readFileSync: () => JSON.stringify(signal),
+      unlinkSync: () => { removed = true; } } };
+  vm.runInNewContext(cleanup + '\nremoveOwnedReadiness', context)(want);
+  return removed;
+}
+test('cleanup removes expired/dead owned lease but preserves foreign and newer launch identity', () => {
+  assert.equal(clean({ ...valid, updatedAt: now - 20000 }), true, 'expired forced-exit lease is ours');
+  for (const patch of [{ launchId: 'b'.repeat(32) }, { launchStartedAt: now }, { pid: 43 }]) {
+    assert.equal(clean({ ...valid, ...patch }), false, JSON.stringify(patch));
+  }
+  assert.equal(clean(valid, {}), false, 'legacy run cannot claim a lease');
+});
+
 test('valid ready and starting leases, including dynamic port discovery', () => {
   assert.equal(parse(valid).state, 'ready');
   assert.equal(parse({ ...valid, state: 'starting' }).state, 'starting');

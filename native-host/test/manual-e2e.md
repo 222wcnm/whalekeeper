@@ -2,7 +2,11 @@
 
 本文档供在真实 Windows 10/11 + Chrome/Edge 环境中人工验证 DSH Manager 使用。沙箱内自动冒烟结果见 [VERIFICATION.md](VERIFICATION.md)；以下步骤覆盖自动测试无法覆盖的浏览器与注册表路径。
 
-> 前置条件：Node.js ≥ 18；已全局安装 dsh（`npm i -g @deepseek-ai/dsh`）；本机为 Windows。
+> 前置条件：dsh 0.2.x 使用 Node.js 22.19+（22.x）或 24+；已全局安装 dsh（`npm i -g @deepseek-ai/dsh`）；本机为 Windows。
+> rc.2 正式自动验收使用 `e2e-current-isolated.js` 与 `DSH_MANAGER_E2E_ROUNDS=3`，
+> 可用 `DSH_MANAGER_VERIFY_UI=1` 包含浏览器；仅隔离 HOME，不运行日常 profile。
+> 本轮启动预算从 spawn 起 150 秒（URL 捕获最多额外 5 秒），非历史 15/30 秒体验目标。
+> 会话行只读；仅统一入口打开 Web UI，已有未认证页另开合法认证入口，不覆盖草稿。
 > 全程建议开一个管理员无关的普通 PowerShell 窗口，并在每一步记录输出。
 
 ---
@@ -10,7 +14,7 @@
 ## 0. 自检（2 分钟）
 
 ```powershell
-node -v                                    # ≥ 18
+node -v                                    # dsh 0.2.x: 22.19+ (22.x) or 24+
 dsh --version                              # 应输出包版本
 Get-Command dsh | Select-Object Source     # 应位于 %APPDATA%\npm\dsh*
 node <repo-root>\native-host\compute-id.js

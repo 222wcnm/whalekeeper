@@ -1,8 +1,8 @@
 # DSH Manager — 浏览器扩展管理 DSH 运行状态 · 设计规格索引
 
 - 文档范围：M1–M13（扩展实际版本见 `extension/manifest.json`）
-- 最近整理：2026-09-23
-- 状态：已实现并通过冒烟/UI 验收（§14）；macOS 与 Firefox 运行时待实测（§6.8/§15）
+- 最近整理：2026-10-26
+- 状态：0.2.1-rc.2 Windows修复与隔离验收通过（§2.1.3：178单测/428smoke/196三轮E2E/121浏览器）；macOS/Firefox未新增实测
 - 目标平台：Windows 10/11 + Chrome / Edge（Linux 平台层与安装器已实测；Firefox/macOS 列为后续）
 
 ---

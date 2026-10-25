@@ -119,6 +119,7 @@ const BASE_ENV = {
   DSH_MANAGER_TEST_MODE: '1',
   DSH_MANAGER_BASE_DIR: BASE,
   DSH_BIN_STUB: FAKE_DSH,
+  DSH_MANAGER_START_TIMEOUT_MS: '15000', // Fake-only suite; real E2E must not inherit this.
 };
 // Windows：默认围栏真实进程枚举 + 关闭 PID 命令行校验——
 //   本机常驻真实 dsh web（127.0.0.1:8080）会让「空目录→stopped」类场景误报 external，
@@ -504,7 +505,7 @@ async function scenarioStaleRecord() {
 async function scenarioStartTimeout() {
   cleanup();
   const resp = runHost({ id: 's13', action: 'start', payload: { port: 31913 } }, 's13',
-    { DSH_FAKE_EXIT_IMMEDIATELY: '1' });
+    { DSH_FAKE_EXIT_IMMEDIATELY: '1', DSH_MANAGER_START_TIMEOUT_MS: '2000' });
   expect(resp && resp.ok === false && resp.error && resp.error.code === 'START_TIMEOUT',
     '13 fake 立即退出 -> START_TIMEOUT', JSON.stringify(resp && resp.error));
   expect(resp && resp.error && typeof resp.error.logTail === 'string' && resp.error.logTail.length > 0,
@@ -1035,7 +1036,7 @@ async function scenarioPortZero() {
     '25 port=70000 -> BAD_REQUEST', JSON.stringify(b2 && b2.error));
 
   // 25f 动态端口未报告（fake 立即退出，URL 行是 port 0 占位）-> START_TIMEOUT
-  const t = runHost({ id: 's25f', action: 'start', payload: { port: 0 } }, 's25f', { DSH_FAKE_EXIT_IMMEDIATELY: '1' });
+  const t = runHost({ id: 's25f', action: 'start', payload: { port: 0 } }, 's25f', { DSH_FAKE_EXIT_IMMEDIATELY: '1', DSH_MANAGER_START_TIMEOUT_MS: '2000' });
   expect(t && t.ok === false && t.error && t.error.code === 'START_TIMEOUT',
     '25 动态端口未报告 -> START_TIMEOUT', JSON.stringify(t && t.error));
 
@@ -1401,6 +1402,67 @@ async function scenarioCurrentCli() {
   }
 }
 
+// rc.2 regressions: shared launch deadline, transient health, slow disposal, owned cleanup.
+async function scenarioRc2Lifecycle() {
+  const readyFile = path.join(BASE, 'ready', 'dsh-web.json');
+  const logFile = path.join(BASE, 'logs', 'dsh-web.log');
+  const leaseEnv = { DSH_FAKE_READY: '1', DSH_MANAGER_LAUNCH_URL_TIMEOUT_MS: '100' };
+
+  // Discovery consumes ~2s; readiness arrives at ~5s, beyond the ONE 4s deadline.
+  const timeoutAt = Date.now();
+  const timed = runHost({ id: 'rc2-timeout', action: 'start', payload: { port: 0 } }, 'rc2-timeout', {
+    ...leaseEnv, DSH_MANAGER_START_TIMEOUT_MS: '4000', DSH_FAKE_LISTEN_DELAY_MS: '2000',
+    DSH_FAKE_READY_DELAY_MS: '3000', DSH_FAKE_URL_DELAY_MS: '2500',
+  });
+  expect(timed?.error?.code === 'START_TIMEOUT', '33 dynamic discovery shares readiness deadline', timed?.error?.message);
+  expect(Date.now() - timeoutAt < 10000, '33 fake test deadline does not reset after port discovery');
+  const pending = readRunFile();
+  expect(pending?.pid > 0, '33 verified starting lease retains a stoppable PID');
+  const stoppedPending = runHost({ id: 'rc2-pending-stop', action: 'stop' }, 'rc2-pending-stop');
+  expect(stoppedPending?.result?.stopMethod === 'graceful', '33 timed-out starting lease can stop gracefully');
+  cleanup();
+
+  const legacy = runHost({ id: 'rc2-legacy-start', action: 'start', payload: { port: 0 } }, 'rc2-legacy-start', {
+    DSH_FAKE_HEALTH_FAILURES: '1',
+  });
+  expect(legacy?.ok, '33 old plugin without ready lease still starts');
+  const legacyStop = runHost({ id: 'rc2-legacy-stop', action: 'stop' }, 'rc2-legacy-stop');
+  expect(legacyStop?.result?.stopMethod === 'graceful', '33 transient legacy health failure retries instead of forcing');
+  expect((fs.readFileSync(logFile, 'utf8').match(/HEALTH-TRANSIENT-FAILURE/g) || []).length === 1,
+    '33 one transient health failure observed');
+  cleanup();
+
+  const delayed = runHost({ id: 'rc2-delay-start', action: 'start', payload: { port: 0 } }, 'rc2-delay-start', {
+    ...leaseEnv, DSH_FAKE_HEALTH_FAILURES: '99', DSH_FAKE_CLOSE_DELAY_MS: '3500', DSH_FAKE_EXIT_DELAY_MS: '4200',
+  });
+  expect(delayed?.ok, '33 lease confirms a plugin whose health endpoint is failing');
+  const delayedStopAt = Date.now();
+  const delayedStop = runHost({ id: 'rc2-delay-stop', action: 'stop' }, 'rc2-delay-stop');
+  expect(delayedStop?.result?.stopMethod === 'graceful' && Date.now() - delayedStopAt >= 3500,
+    '33 listener open beyond 3 seconds still disposes gracefully');
+  expect(!fs.readFileSync(logFile, 'utf8').includes('HEALTH-TRANSIENT-FAILURE'), '33 same-identity lease bypasses health');
+  expect(!fs.existsSync(readyFile), '33 graceful stop removes own ready lease');
+  cleanup();
+
+  const forced = runHost({ id: 'rc2-force-start', action: 'start', payload: { port: 0 } }, 'rc2-force-start', {
+    ...leaseEnv, DSH_FAKE_EXIT_DELAY_MS: '15000',
+  });
+  expect(forced?.ok, '33 force-cleanup fixture started');
+  const previous = readRunFile();
+  const signal = JSON.parse(fs.readFileSync(readyFile, 'utf8'));
+  const forceStop = runHost({ id: 'rc2-force-stop', action: 'stop' }, 'rc2-force-stop', { DSH_MANAGER_STOP_TIMEOUT_MS: '1000' });
+  expect(forceStop?.result?.stopMethod === 'force', '33 real force path is reported');
+  expect(!fs.existsSync(readyFile) && readRunFile() === null, '33 forced exit removes owned ready and run records');
+  expect(!pidAlive(previous.pid) && !(await portOpen(previous.port)), '33 old PID and port both gone');
+
+  // A later launch's lease must survive dead-record/status cleanup.
+  fs.writeFileSync(path.join(BASE, 'run', 'dsh-web.json'), JSON.stringify(previous));
+  fs.writeFileSync(readyFile, JSON.stringify({ ...signal, launchId: 'b'.repeat(32) }));
+  const status = runHost({ id: 'rc2-stale-status', action: 'status' }, 'rc2-stale-status');
+  expect(status?.result?.state === 'stopped' && fs.existsSync(readyFile), '33 stale run cleanup preserves foreign ready identity');
+  cleanup();
+}
+
 // 主流程
 // ---------------------------------------------------------------------------
 async function main() {
@@ -1465,6 +1527,8 @@ async function main() {
   try { await scenarioSourceOverlay(); } catch (e) { record('source', '场景 31 异常', false, e.message); }
   cleanup();
   try { await scenarioCurrentCli(); } catch (e) { record('cli', '场景 32 异常', false, e.message); }
+  cleanup();
+  try { await scenarioRc2Lifecycle(); } catch (e) { record('rc2', '场景 33 异常', false, e.message); }
   cleanup();
 
   const failed = results.filter((r) => !r.ok);

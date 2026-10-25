@@ -21,7 +21,7 @@ const ERROR_TEXTS = {
   PORT_BUSY: '端口已被其他程序占用，请在设置中更换端口',
   ALREADY_RUNNING: 'dsh web 已在运行（幂等成功）',
   ALREADY_STOPPED: 'dsh web 已停止（幂等成功）',
-  START_TIMEOUT: '启动超时：30 秒内端口未就绪，请查看日志',
+  START_TIMEOUT: '启动超时：等待服务就绪未完成，请查看日志',
   STOP_FAILED: '停止失败：无法终止 dsh 进程，请检查权限或手动处理',
   EXTERNAL_UNMANAGED: '未找到可接管的外部实例（可能已退出或变化）；请重新打开面板刷新，或在其原终端停止',
   BUSY: '操作进行中，请稍候再试',
@@ -62,7 +62,7 @@ const ACTION_LABELS = {
   stop: { idle: '停止', busy: '停止中…', progress: { stopping: '正在停止：等待端口关闭' } },
   restart: {
     idle: '重启', busy: '重启中…',
-    progress: { stopping: '正在重启：停止旧进程', starting: '正在重启：新进程启动中，等待端口就绪' },
+    progress: { restarting: '正在重启：等待宿主完成并确认服务就绪' },
   },
   adopt: { idle: '接管', busy: '接管中…', progress: { starting: '正在接管外部实例' } },
 };
@@ -72,7 +72,7 @@ let state = 'unknown'; // stopped | starting | running | stopping | error | exte
 let detail = null; // 最近一次 status 的 result
 let lastError = null; // { code, message, logTail? }
 // pending —— 用户发起、尚未收敛到终态的操作（乐观反馈：按钮转圈 + 进度条 + 阶段文案）
-// { action, phase: 'stopping' | 'starting', atMs, ack }；ack=true 表示 native 请求在途
+// { action, phase: 'stopping' | 'starting' | 'restarting', atMs, ack }；ack=true 表示 native 请求在途
 let pending = null;
 let startedAtMs = null; // running 起点（用于 mm:ss 时长）
 let reqSeq = 0;
@@ -85,6 +85,12 @@ let lastDriftKey = null; // 上次状态漂移提示的键（相同漂移去重�
 // M9 会话区（design §8.10）：只读摘要元数据（{available, items}），不读消息内容。
 // sessionsData===null 表示尚未拿到数据或请求失败（会话区隐藏）。
 let sessionsData = null;
+let sessionsRevision = 0; // mirror 到达后，丢弃此前在途的 native 快照（包括失败）
+let sessionsRequestSeq = 0;
+let sessionsUpdatedAt = 0;
+let sessionsMirrorTimer = null;
+let sessionsFromMirror = false;
+const SESSIONS_MIRROR_MAX_AGE_MS = 5000; // 镜像没有连接状态字段，过期只依赖 native 2s 保底
 
 // M11 已读机制（本地展示层，不触碰 dsh 数据）：readSessions { [sessionId]: readAt }。
 // 已读只作用于「已完成会话」：readAt 晚于完成时刻 → 隐藏；会话重新活跃（working/
@@ -291,6 +297,7 @@ function bindEvents() {
     if (tickTimer) clearInterval(tickTimer);
     for (const t of readTimers) clearInterval(t);
     readTimers = [];
+    if (sessionsMirrorTimer) clearTimeout(sessionsMirrorTimer);
   });
 }
 
@@ -392,8 +399,10 @@ async function manualRefresh() {
 
 function applyStatus(result) {
   const prev = state;
+  const previousPort = detail && detail.port;
   state = result.state || 'unknown';
   detail = result;
+  if ((state !== 'running' && state !== 'external') || previousPort !== detail.port) invalidateSessions();
 
   // 状态漂移通知（无用户操作时；首次 init 的 prev='unknown' 不触发）
   if (!pending && prev !== 'unknown') {
@@ -469,38 +478,55 @@ function finishPending(msg, kind) {
   if (msg) showToast(msg, kind);
 }
 
+function invalidateSessions() {
+  sessionsRevision += 1;
+  sessionsData = null;
+  sessionsUpdatedAt = 0;
+  sessionsFromMirror = false;
+  if (sessionsMirrorTimer) { clearTimeout(sessionsMirrorTimer); sessionsMirrorTimer = null; }
+}
+
 // 失败静默：会话区隐藏而非报错（§8.10：不阻断其余功能，除降级提示外不打扰）
 async function refreshSessions() {
+  const revision = sessionsRevision;
+  const sequence = ++sessionsRequestSeq;
+  const port = detail && detail.port;
   let resp;
-  try {
-    resp = await nativeRequest('sessions', {});
-  } catch (_) {
-    sessionsData = null;
-    applySessions();
-    return;
-  }
-  if (!resp.ok || !resp.result || typeof resp.result !== 'object') {
-    sessionsData = null;
-    applySessions();
-    return;
-  }
-  sessionsData = {
+  try { resp = await nativeRequest('sessions', {}); } catch (_) { /* 不可用 */ }
+  if (revision !== sessionsRevision || sequence !== sessionsRequestSeq || port !== (detail && detail.port)) return;
+  if (sessionsMirrorTimer) { clearTimeout(sessionsMirrorTimer); sessionsMirrorTimer = null; }
+  sessionsFromMirror = false;
+  sessionsUpdatedAt = Date.now();
+  sessionsData = resp && resp.ok && resp.result && typeof resp.result === 'object' ? {
     available: resp.result.available === true,
     items: Array.isArray(resp.result.items) ? resp.result.items : [],
-  };
+  } : null;
   applySessions();
 }
 
-// M12 镜像桥（design §8.10.1）：面板 SSE 事件流 → SW storage.sessionsCache →
-// popup storage.onChanged 即时渲染（<500ms）。native sessions 快照仍作保底
-// （无 dsh 标签/镜像缺失时）；两者同源同构，后写赢。
+// 镜像只作新鲜摘要；无连接状态字段，不能让已缓存 completed 永久冒充当前数据。
+// native 2s 保底仍执行，任何早于新镜像的在途 native 响应均丢弃。
 function applyMirrorSessions(cache) {
-  const port = detail && typeof detail.port === 'number' && Number.isFinite(detail.port) ? detail.port : null;
-  if (!port) return; // 状态未就绪/动态端口未回填：等 native 快照
+  const port = detail && detail.port;
+  if (!Number.isInteger(port) || port < 1 || port > 65535) return;
   if (state !== 'running' && state !== 'external') return;
   const entry = cache && typeof cache === 'object' ? cache[String(port)] : null;
-  if (!entry || !Array.isArray(entry.items)) return;
+  if (!entry || !Array.isArray(entry.items) || !Number.isFinite(entry.at)) return;
+  const age = Date.now() - entry.at;
+  if (age < 0 || age >= SESSIONS_MIRROR_MAX_AGE_MS || entry.at < sessionsUpdatedAt) return;
+  sessionsRevision += 1;
+  sessionsUpdatedAt = entry.at;
+  sessionsFromMirror = true;
   sessionsData = { available: true, items: entry.items };
+  if (sessionsMirrorTimer) clearTimeout(sessionsMirrorTimer);
+  sessionsMirrorTimer = setTimeout(() => {
+    sessionsMirrorTimer = null;
+    if (!sessionsFromMirror) return;
+    sessionsFromMirror = false;
+    sessionsRevision += 1;
+    sessionsData = null;
+    applySessions();
+  }, SESSIONS_MIRROR_MAX_AGE_MS - age);
   applySessions();
 }
 
@@ -668,11 +694,7 @@ function renderSessionUnit(item) {
     }
   }
 
-  row.style.cursor = 'pointer';
-  row.addEventListener('click', (e) => {
-    if (e.target.closest('.btn-mark-read, .inline-undo-pill')) return;
-    openWebUI(item.sessionId ? `/#/chat/${item.sessionId}` : '/');
-  });
+  // rc.2 无会话 URL 导航契约：摘要行只读，导航交回统一 Web UI 入口。
 
   row.appendChild(leftWrap);
   row.appendChild(rightWrap);
@@ -810,7 +832,7 @@ async function doAction(action) {
   // 乐观反馈：立即进入过渡态 —— 按钮禁用+转圈、圆点脉冲、进度条与阶段文案
   pending = {
     action,
-    phase: (action === 'stop' || action === 'restart') ? 'stopping' : 'starting',
+    phase: action === 'restart' ? 'restarting' : action === 'stop' ? 'stopping' : 'starting',
     atMs: Date.now(),
     ack: true,
   };
@@ -876,105 +898,81 @@ async function doAction(action) {
   // 状态由 2s 轮询自愈；绝不在 null 上写字段（Cannot set properties of null）
   if (!pending) return;
   const result = resp.result || {};
-  if (action === 'restart' && result.state === 'starting') {
-    // 宿主内先 stop 后 start：ack 时旧进程已停、新进程已 spawn
-    pending.phase = 'starting';
-    showToast('旧进程已停止，新进程启动中…', 'info');
-  }
   pending.ack = false;
   applyStatus(result); // 若已 running → finishPending 弹完成 toast
   refreshStatus(); // 立即收敛一次（SW 队列此时空闲）
 }
 
 // ---------------------------------------------------------------------------
-// 打开/智能定向 Web UI（Smart Tab Focus & Reuse）
-// 规则：无则新建并定位，有则定向激活（当前窗口 > 目标会话精准匹配 > 最近活跃 MRU）
+// 打开 Web UI：只聚焦已确认认证的同端口标签，绝不重载/覆盖原标签的草稿。
+// rc.2 没有 URL 会话定位契约，不接收/生成会话 hash。
 // ---------------------------------------------------------------------------
 
-async function openWebUI(targetPath) {
-  const port = (detail && detail.port) || (settings ? settings.port : DEFAULT_SETTINGS.port);
-  if (!port) return; // M4：动态端口未回填时无 URL 可开
-
-  const pathSuffix = (typeof targetPath === 'string' && targetPath) ? targetPath : '/';
-  // M13（§2.1.1 B1）：dsh ≥ 0.1.2 起裸 URL 打开会 401——新标签优先用 run 记录
-  // 捕获的 launchUrl（含 token query；§12.3 边界：仅用于打开标签，不写入
-  // storage、不显示在 UI 文本）。深链：token 是 query 参数，hash 后缀在 303
-  // 重定向后由浏览器保留（`/?token=…/#/chat/x` → 认证后 `/#/chat/x`）。
-  const bareUrl = 'http://127.0.0.1:' + port;
-  const launchBase = (detail && typeof detail.launchUrl === 'string' && detail.launchUrl.length > 0)
-    ? detail.launchUrl
-    : bareUrl;
-  const launchTarget = new URL(launchBase);
-  if (pathSuffix !== '/') launchTarget.hash = pathSuffix.slice(1);
-  const targetUrl = pathSuffix === '/' ? launchBase : launchTarget.href;
-  // 已有标签（已换取 cookie、URL 干净）的复用/跳转仍用裸 URL（避免重复走
-  // token 兑换重定向）
-  const bareTargetUrl = pathSuffix === '/' ? bareUrl : bareUrl + pathSuffix;
-
-  // DSH Web UI 的两种可能 URL 前缀
-  const prefixes = [
-    'http://127.0.0.1:' + port,
-    'http://localhost:' + port,
-  ];
-
+function loopbackHttpUrl(value) {
   try {
-    // 获取所有标签页，在 JS 中手动匹配 URL 前缀
-    // 避免 chrome.tabs.query({ url: pattern }) 的 match pattern 兼容性问题
-    const allBrowserTabs = await chrome.tabs.query({});
-    const matchedTabs = allBrowserTabs.filter(t =>
-      t.url && prefixes.some(p => t.url.startsWith(p))
-    );
+    const url = new URL(value);
+    if (url.protocol !== 'http:' || !['127.0.0.1', 'localhost'].includes(url.hostname)
+      || url.username || url.password) return null;
+    return url;
+  } catch (_) { return null; }
+}
 
-    if (matchedTabs.length > 0) {
-      // 获取当前操作所在窗口 ID
-      const currWin = await chrome.windows.getCurrent().catch(() => null);
-      const currentWindowId = currWin ? currWin.id : null;
+function validLaunchUrl(value, port) {
+  if (typeof value !== 'string' || value.length > 8192) return null;
+  const url = loopbackHttpUrl(value);
+  if (!url || Number(url.port || 80) !== port || url.pathname !== '/' || url.hash) return null;
+  const params = [...url.searchParams.entries()];
+  if (params.length !== 1 || params[0][0] !== 'token' || !/^[A-Za-z0-9._~-]{1,4096}$/.test(params[0][1])) return null;
+  return url.href;
+}
 
-      // 4 级决策排序：
-      // 1. 精确会话路径匹配优先
-      // 2. 当前窗口优先
-      // 3. 最近活跃 (lastAccessed) 优先
-      matchedTabs.sort((a, b) => {
-        if (pathSuffix && pathSuffix !== '/') {
-          const aMatch = a.url && a.url.includes(pathSuffix);
-          const bMatch = b.url && b.url.includes(pathSuffix);
-          if (aMatch && !bMatch) return -1;
-          if (bMatch && !aMatch) return 1;
-        }
-        if (currentWindowId) {
-          if (a.windowId === currentWindowId && b.windowId !== currentWindowId) return -1;
-          if (b.windowId === currentWindowId && a.windowId !== currentWindowId) return 1;
-        }
-        return (b.lastAccessed || 0) - (a.lastAccessed || 0);
-      });
+async function tabAuthenticated(tab, port) {
+  if (tab.discarded || tab.status === 'unloaded') return false;
+  let timer;
+  try {
+    const timeout = new Promise((resolve) => { timer = setTimeout(() => resolve(null), 1500); });
+    const status = await Promise.race([
+      chrome.tabs.sendMessage(tab.id, { type: 'dsh-auth-status' }, { frameId: 0 }),
+      timeout,
+    ]);
+    return !!status && status.authenticated === true && status.port === port;
+  } catch (_) { return false; }
+  finally { clearTimeout(timer); }
+}
 
-      const bestTab = matchedTabs[0];
-
-      // 1. 激活标签页
-      await chrome.tabs.update(bestTab.id, { active: true });
-
-      // 2. 唤醒并置顶窗口（若在后台或其他显示器窗口）
-      if (bestTab.windowId) {
-        await chrome.windows.update(bestTab.windowId, { focused: true }).catch(() => {});
-      }
-
-      // 3. 特殊状态处理：
-      // 若处于 Chrome 原生网络报错页或休眠卸载态，执行唤醒重新加载
-      const isErrorPage = bestTab.url && (bestTab.url.startsWith('chrome-error://') || bestTab.status === 'unloaded' || bestTab.discarded);
-      if (isErrorPage) {
-        await chrome.tabs.reload(bestTab.id).catch(() => {});
-      } else if (pathSuffix && pathSuffix !== '/' && bestTab.url && !bestTab.url.includes(pathSuffix)) {
-        // 软路由跳转到目标会话页（已有标签已认证——用裸 URL，不带 token）
-        await chrome.tabs.update(bestTab.id, { url: bareTargetUrl }).catch(() => {});
-      }
+async function openWebUI() {
+  // 有 status 时以实际端口为准，0/无效值不可回落到旧设置端口。
+  const port = detail ? detail.port : (settings ? settings.port : DEFAULT_SETTINGS.port);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) return;
+  const bareUrl = 'http://127.0.0.1:' + port;
+  const launchUrl = validLaunchUrl(detail && detail.launchUrl, port);
+  try {
+    const tabs = await chrome.tabs.query({});
+    const candidates = tabs.filter((tab) => {
+      const url = loopbackHttpUrl(tab.url);
+      return url && Number(url.port || 80) === port;
+    });
+    const current = await chrome.windows.getCurrent().catch(() => null);
+    candidates.sort((a, b) => {
+      const aHere = !!current && a.windowId === current.id;
+      const bHere = !!current && b.windowId === current.id;
+      if (aHere !== bHere) return aHere ? -1 : 1;
+      return (b.lastAccessed || 0) - (a.lastAccessed || 0);
+    });
+    const authenticated = await Promise.all(candidates.map((tab) => tabAuthenticated(tab, port)));
+    const best = candidates.find((_, index) => authenticated[index]);
+    if (best) {
+      await chrome.tabs.update(best.id, { active: true });
+      if (Number.isInteger(best.windowId)) await chrome.windows.update(best.windowId, { focused: true }).catch(() => {});
       return;
     }
-  } catch (e) {
-    console.warn('[Whalekeeper] 智能定向异常，降级为新建标签页:', e);
-  }
+  } catch (_) { /* 查询/聚焦失败时仅新建，不把 URL（可能含 token）写入日志 */ }
 
-  // 无已有标签页或异常降级：新建标签页
-  chrome.tabs.create({ url: targetUrl });
+  // 401/休眠/无 listener 不能确认认证：另开，不修改原标签。
+  // 外部/接管实例无启动令牌只能裸 URL 降级，提示从原启动入口认证。
+  if (!launchUrl) showToast('无法确认认证入口；如需登录，请使用该实例的原启动 URL', 'info');
+  try { await chrome.tabs.create({ url: launchUrl || bareUrl }); }
+  catch (_) { showToast('无法打开 Web UI，请使用该实例的原启动 URL', 'error'); }
 }
 
 // 打开日志查看页（智能复用已有日志 Tab，避免重复多开）
@@ -1322,6 +1320,7 @@ function hideToast() {
 
 function setError(err) {
   lastError = err || {};
+  invalidateSessions();
   state = 'error'; // 与 Web UI 一致：错误态显示红色圆点，下次 status 轮询自动恢复
   const code = lastError.code || 'NATIVE_ERROR';
   const friendly = ERROR_TEXTS[code] || lastError.message || code;

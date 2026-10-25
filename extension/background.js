@@ -41,12 +41,12 @@ const DEFAULT_SETTINGS = {
 };
 const PROBE_TIMEOUT_MS = 1500; // 探活超时
 const NATIVE_TIMEOUT_MS = 30000; // 等待宿主响应兜底超时（默认）
-// 按动作区分兜底超时：宿主内 stop(≤10s)+start(≤30s) 串行执行的 restart 需更长，
-// 避免长操作被默认 30s 误判为「宿主无响应」→ NATIVE_ERROR（与 design §6.3 一致）
+// rc.2：宿主从 spawn 起共享 150s + 最多 5s URL 捕获；预检、停止与 IPC 留有余量。
+// Native Messaging port 仅在该动作在途时持有；不依赖 Popup 存活，不使用常驻保活。
 const ACTION_TIMEOUT_MS = {
-  restart: 120000,
-  start: 60000,
-  stop: 45000,
+  restart: 240000,
+  start: 210000,
+  stop: 60000,
   adopt: 45000,
   sessions: 8000, // M9：只读会话快查，含宿主 1.5s 端点超时
 };
@@ -228,11 +228,15 @@ function pickAggregate() {
   return null;
 }
 
-// 从 sender.tab.url 解析实例端口（127.0.0.1:PORT；无端口 → null）
+// 只接受当前支持的 HTTP 回环实例；按有效端口归并，浏览器省略 :80 不等于未知。
 function portFromUrl(url) {
-  const m = /^https?:\/\/(?:127\.0\.0\.1|localhost)(?::(\d+))?\//.exec(String(url || ''));
-  if (!m) return null;
-  return m[1] ? boundNum(m[1], 65535) : null;
+  try {
+    const parsed = new URL(String(url || ''));
+    if (parsed.protocol !== 'http:' || !['127.0.0.1', 'localhost'].includes(parsed.hostname)
+      || parsed.username || parsed.password) return null;
+    const port = parsed.port === '' ? 80 : Number(parsed.port);
+    return Number.isInteger(port) && port >= 1 && port <= 65535 ? port : null;
+  } catch (_) { return null; }
 }
 
 // content script 上报：仅 sender.tab 存在且为 dsh 回环页时接受（页面来源），
@@ -244,7 +248,8 @@ async function handleAttention(msg, sender) {
   // L3 加固：只接受 dsh 页面（127.0.0.1/localhost 回环）来源——扩展/其他页面的 content
   // script 无法伪造（其 tab.url 不在本扩展 host_permissions 内时不填充，同样被拒）
   const tabUrl = sender.tab.url;
-  if (typeof tabUrl !== 'string' || !/^https?:\/\/(127\.0\.0\.1|localhost)(:\d+)?\//.test(tabUrl)) return;
+  const instancePort = portFromUrl(tabUrl);
+  if (instancePort === null) return;
   if (msg.op === 'clear') {
     if (!attentionCache[tabId]) return;
     delete attentionCache[tabId];
@@ -258,7 +263,7 @@ async function handleAttention(msg, sender) {
       working: boundNum(counts.working, 99),
       waiting: boundNum(counts.waiting, 99),
       at: Date.now(),
-      port: portFromUrl(tabUrl),
+      port: instancePort,
     };
   } else {
     return;
@@ -334,7 +339,6 @@ async function handleSessionsSync(msg, sender) {
   const tabId = sender && sender.tab && Number.isInteger(sender.tab.id) ? sender.tab.id : null;
   if (!tabId) return;
   const tabUrl = sender.tab.url;
-  if (typeof tabUrl !== 'string' || !/^https?:\/\/(127\.0\.0\.1|localhost)(:\d+)?\//.test(tabUrl)) return;
   const port = portFromUrl(tabUrl);
   if (!port) return;
   const items = Array.isArray(msg.items) ? msg.items.slice(0, SESSIONS_CACHE_MAX) : [];
@@ -658,7 +662,7 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 
 chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
   if (!changeInfo.url) return; // 仅 URL 变化时判定（标题/图标等变化与归属无关）
-  if (/^https?:\/\/(127\.0\.0\.1|localhost)(:\d+)?\//.test(changeInfo.url)) return; // 仍在 dsh 回环页
+  if (portFromUrl(changeInfo.url) !== null) return; // 仍在支持的 HTTP 回环页
   if (!attentionCache[tabId]) return;
   delete attentionCache[tabId];
   chrome.storage.local.set({ [ATTENTION_STORE_KEY]: attentionCache });

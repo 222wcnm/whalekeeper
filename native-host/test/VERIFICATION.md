@@ -1,5 +1,81 @@
 # DSH Manager — 测试与验收报告（VERIFICATION）
 
+## 发布前复审与启动耗时定位（2026-10-26）
+
+扩展 0.3.2、配套插件 0.4.2 完成增量审查与重新验收：单测 **178/178 PASS、0 SKIP**；
+Windows 开发目录 smoke **428 PASS / 0 FAIL / 1 POSIX SKIP**；发布副本独立 smoke
+**422 PASS / 0 FAIL / 4 SKIP**（3 项本地安装副产物和 1 项 POSIX 检查按全新克隆预期跳过）。
+本轮重新执行三轮真实隔离生命周期 **196/196 PASS**，首轮含 Chrome **156.0.8078.48
+浏览器 121/121 PASS**。12 次独立启动全部严格 graceful 退出，清理无 force、errors 或
+warnings，PID/监听/run/PID文件/ready/lock 均无残留。start 9.98–22.00s、restart
+13.35–23.50s、stop 2.22–2.63s；真实断流 5ms 撤销 live、隐藏页 13.79s 重连，
+HTTP/镜像一致且 `falseDone=false`。
+
+正式证据根 `.e2e-current/run-mvo3y5wp-91931053/`，含各轮报告、首轮 `ui.log`、
+`ui/real-sse-recovery.json` 与严格核对后的 `verified-summary.json`。本轮所选 CLI 是
+全局 DSH 0.2.1-rc.2 及全部依赖的 D 盘隔离副本；复制 63,660 个文件无失败，CLI、
+app-boot、Cordis 的关键源码 SHA-256 与原安装一致。生产 host 和扩展源码原样执行，
+未改正式 150s 预算、HTTP 行为、权限或版本范围，也未修改日常全局安装、profile 或注册。
+下文 2026-10-19 的三轮 196 项为历史验收，与本轮重新执行的 196 项分别保留。
+
+### 先前超时的定位证据
+
+初次完整运行在动态重启处通过 54 项后触发 150s `START_TIMEOUT`，之前的三个启动也
+耗时 131–141s；清理阶段才观察到同一启动的 ready 信号。该失败保留于
+`.e2e-current/run-mvo19xzs-f18617ae/`，未计作通过，测试实例已完整清理。
+后续同机器、同 Node v24.19.0、同模块文件的只读对照如下：
+
+| 调用 | 工具启动的进程 | 用户独立 PowerShell |
+|---|---:|---:|
+| 原 AppData 安装目录 `statSync` | 1.173ms | 0.0126ms |
+| 原 AppData 安装目录 `realpathSync` | 14.982ms | 0.0867ms |
+| D 盘相同模块副本 `realpathSync` | 0.0788ms | 0.0833ms |
+
+证据支持将慢点定位为**本次工具执行链路访问 AppData 时的额外文件访问开销**，而非
+新插件代码的启停回归；具体底层拦截组件未证实，不据此修改 ACL、杀软或系统配置。
+内存紧张和换页较高是伴随因素，关闭一台模拟器后可用内存约 1.5GB，但目录差异仍存在。
+关键原始对照保留在开发目录 ignored 的 `.review-fs-tool-control.json` 与
+`.review-fs-user-terminal.json`。同字节 D 盘副本先完成单轮 **65/65** 路径对照，随后
+完成上述正式三轮及浏览器验收；未用诊断预加载器或放宽超时替代正式通过。
+
+本轮另修复两类验收竞态：认证失败日志用例的测试专用预算从 1.8s 调整为 10s；UI
+验收有界等待扩展页面/托管面板实际就绪，合成帧只发给已注入且属于本扩展的隔离上下文。
+首轮固定等待误报 6 项的尝试保留于 `.e2e-current/run-mvo0xoy5-96be4c8b/`；诊断预加载
+和未完成副本的尝试均不计正式通过。macOS/Firefox 未新增运行覆盖。
+
+## 当前增量：DSH 0.2.1-rc.2（2026-10-19 验收通过）
+
+本轮使用工作区生产源码、Node v24.19.0 与精确 npm CLI 0.2.1-rc.2。
+已复验插件 87 条 + 扩展 62 条（58 UI/状态 + 4 后台）+ 宿主 29 条，共
+**178/178 PASS，0 SKIP**；真实 Cordis 4.0.5 挂载/卸载/重挂测试与超过 15 秒的
+Native stdio 请求实际执行。首轮生产源码隔离 E2E **65/65 PASS**（固定/动态均含
+重启与严格 graceful stop，无残留、无紧急 force）。含 UI 单轮 **66/66 PASS**，
+Chrome 155 浏览器 **121/121 PASS**；最终连续三轮生产源码隔离 E2E **196/196 PASS**
+（第一轮66、后两轮各65，其中第一轮另运行浏览器121条）。12个独立launch、固定/动态
+各三次start/restart/stop全部严格graceful；每轮cleanup无force/errors/warnings，
+PID/端口/run/PID文件/ready/lock均清。三轮start4.99–8.00s、restart6.78–10.04s、
+stop1.68–2.06s，完整report验证生产host SHA-256未变。
+完整 Windows smoke **428 PASS / 0 FAIL / 1 POSIX SKIP**（33 场景），包含新共享
+截止、health 重试、迟关端口、force 清理与外来租约保护；未修改日常注册。
+最初含 UI 尝试因隔离 HOME 缺 Local 目录使 Chrome 不能确认非默认 profile 而中断；
+建立本 case `USERPROFILE/AppData/Local` 后单变量重试通过，另缩短目录避免 Windows
+嵌套文件路径过长。未放宽 Chrome 默认目录安全检查，失败尝试未计通过、DSH 清理完整。
+单轮真实浏览器恢复实测：断流撤销 live 173ms，hidden 重连 13934ms，HTTP/镜像一致且
+`falseDone=false`。证据：`.e2e-current/run-mvec1d3f-5847a6cf/r1-f3b11f34/ui.log` 及其
+`ui/real-sse-recovery.json`（隔离产物，不入库）。
+最终证据根：`.e2e-current/run-mvec4ykk-17c724ee/`，总表 `report.json`、核验
+`verified-summary.json`、各轮 `report.json`、首轮 `ui.log` / `ui/real-sse-recovery.json`。
+最终真实断流撤销live122ms、hidden重连13737ms，7条真实恢复断言全通过，HTTP与
+镜像一致、`falseDone=false`。独立只读生产diff审查无阻断；所有正式产物保留本机ignored。
+日常GUI64847仍由原PID31888监听，测试未访问/重启它，未改日常profile或宿主注册。
+macOS/Firefox、TLS/IPv6/远程入口无新增运行结论；Windows无lease的超时PID仍需用户
+显式接管，历史tasklist node镜像校验边界未扩大重构。
+
+诊断副本不计通过。下文是 M1 历史报告，30s/3s 等历史
+时序及测试计数不代表当前行为，现行契约见设计 §2.1.3/§6.3。
+
+---
+
 - 日期：2026-08-13
 - 角色：测试与验收工程师（静态交叉核对 + 冒烟测试 + 语法终检）
 - 权威规格：`docs/design.md`（v0.2 全文逐条对照）

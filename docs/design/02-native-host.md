@@ -93,7 +93,7 @@
 | `PORT_BUSY` | 目标端口被非 dsh 进程占用 | 「端口 3080 已被其他程序占用」 |
 | `ALREADY_RUNNING` | start 时已在运行 | 视为成功（幂等） |
 | `ALREADY_STOPPED` | stop 时已停止 | 视为成功（幂等） |
-| `START_TIMEOUT` | 30s 内端口未就绪 | 附日志尾部 20 行 |
+| `START_TIMEOUT` | 共享 150s 启动预算耗尽仍未就绪 | 附日志尾部 20 行；说明实际阶段与耗时 |
 | `STOP_FAILED` | taskkill 失败（无权限/进程已变） | 附 system 错误信息 |
 | `EXTERNAL_UNMANAGED` | 检测到外部运行的 dsh web（非本扩展启动），拒绝停止/重启；adopt 目标不存在时亦返回 | 「检测到外部运行的 dsh web，请先接管或在其原终端停止」 |
 | `BUSY` | 锁被另一宿主持有 | 「操作进行中，请稍候」 |
@@ -101,6 +101,16 @@
 | `INTERNAL` | 宿主自身异常 | 附 stack（仅开发模式） |
 
 ### 6.3 动作实现规范
+
+**rc.2 修复契约（2026-10-18；优先于下列历史时限）**：global/NPX/source 从 spawn 起
+共用 150 秒就绪截止时间，动态端口发现及等待 ready 不得各自重置预算；URL 捕获最多
+额外 5 秒。SW start/restart/stop 分别 210/240/60 秒，stdio 看门狗处理在途请求时停用。
+日志记录阶段和实际耗时，不输出 token；超时不擅自杀进程，且只允许核验后的 PID 建记录。
+停止以有效同身份 readiness 或健康探测确认插件；健康失败在有界窗口重试一次。
+shutdown 后一次性等 PID+端口均退出 10 秒（不再以 3 秒端口未关提前强杀），再复核
+PID 后强制、等 3 秒；据真实路径返回 stopMethod。成功/已死清理只属于本次
+launchId+launchStartedAt+PID 的 ready 文件，外来/新启动租约不受影响；停止失败保留记录。
+Native action、字段与 readiness v1 均不变，不引入可由 payload 指定的文件或超时。
 
 **status**
 
@@ -135,18 +145,18 @@ M13 二期优先规则：有效就绪文件（§6.9）直接返回 running 与�
    - 日志文件先 `mkdir -p`：POSIX 用追加打开的 fd（`fs.open(..., 'a')`），宿主退出后 fd 随宿主关闭，不影响 dsh 后续写入；Windows 由 cmd 重定向追加（语义一致）。
    - **不用 pipe**：pipe 会在宿主退出后产生 EPIPE 风险；日志文件同时是 M3「查看日志」与「解析实际端口」的数据源（F5）。
    - **隐藏控制台载体（M5.5，2026-08-15 实现）**：Windows 下 `detached:true` 由 libuv 无条件加 `DETACHED_PROCESS`（子进程既不继承也不新建控制台），且受限令牌下 `CREATE_NO_WINDOW` 不可用（`STATUS_DLL_INIT_FAILED`，`@deepseek-ai/dsh-sandbox-windows-acl` README 记载）——直接 spawn 的 dsh 必然无控制台，其每次执行命令都会新建一闪而过的终端窗口。M5.5 改为**隐藏控制台载体**启动：宿主先写 `launch-hidden.vbs`（`BASE_DIR` 下，运行时自生成），再 `wscript.exe` 执行 `WScript.Shell.Run(cmd, 0, False)`——`windowStyle=0`（SW_HIDE）使 dsh 获得一个**存在但从不显示**的控制台：其命令子进程继承该控制台（不再闪窗），桌面也无常驻窗口。**必须显式 `cmd /d /c call` 执行**：`WshShell.Run` 对引号开头（exe 路径）的命令直接 CreateProcess，`1>> 日志 2>&1` 会被当成普通参数丢失（实测发现，2026-08-15）；`call` 同时避开 cmd /c 的剥引号规则；`%` 按 cmd 规则转义为 `%%`。载体进程（wscript→cmd）即刻退出，dsh 独立存活。**实测核验（EnumWindows 窗口枚举）**：载体下 dsh 控制台窗口存在但不可见（IsWindowVisible=false），其子进程零新窗口（对比直接 spawn 时子进程弹可见新终端，2026-08-15）。POSIX 无控制台概念，维持直接 spawn。若 dsh 上游修复受限令牌限制（沙箱可直接 `CREATE_NO_WINDOW`），可移除载体回归直接 spawn。
-6. 写 run 记录（先写 `.tmp` 再 `rename`，内容含 pid、port、profile、startedAt、version、cmdline；M4 新增 `requestedPort` 与 `logStartBytes`（spawn 时刻日志字节偏移）；**M13 新增 `launchUrl`**——完整启动 URL 行 `dsh web: <url>`（含 token query，§6.2/F5）：固定端口在就绪轮询内（第 7 步）从日志捕获，`--port 0` 在第 9 步回填端口时一并捕获；未捕获为 null，不阻塞启动）。**M5.5 时序**：记录在「端口就绪 + PID 已知」后才写——Windows 载体不回传 PID，端口就绪后经端口表反查（`findPidByPort`，带 200ms 短重试）；启动期间（端口就绪前）无记录，status 显示 stopped（快速连点由第 2 步的锁兜底，见第 7 步）。失败路径（`START_TIMEOUT` / 动态端口未报告）**尽力回写**：POSIX 直接用 spawn 已知的 pid；Windows 端口已知时经端口表反查、未知时经进程表匹配 bin+`--port 0`（尽力而为）；匹配失败仅记日志——实例可能仍在运行，刷新 popup 后可按 external「接管」停止。
-7. 释放锁（**M5.5：锁保持到 run 记录写入完成之后**——启动窗口内并发 start 被锁挡下，`--port 0`（无占用探测）亦被覆盖，防双开；轮询在锁内进行）；轮询端口（500ms 间隔，最长 30s）。就绪 → `running`；超时 → 返回 `START_TIMEOUT` + 日志尾部（此时**不杀进程**，交由用户查看日志后决定；进程可能仍在后台最终就绪）。
+6. 写 run 记录（先写 `.tmp` 再 `rename`，内容含 pid、port、profile、startedAt、version、cmdline；M4 新增 `requestedPort` 与 `logStartBytes`（spawn 时刻日志字节偏移）；**M13 新增 `launchUrl`**——完整启动 URL 行 `dsh web: <url>`（含 token query，§6.2/F5）：固定端口在就绪轮询内（第 7 步）从日志捕获，`--port 0` 在第 9 步回填端口时一并捕获；未捕获为 null，不阻塞启动）。**M5.5 时序**：记录在「端口就绪 + PID 已知」后才写——Windows 载体不回传 PID，端口就绪后经端口表反查（`findPidByPort`，带 200ms 短重试）；启动期间（端口就绪前）无记录，status 显示 stopped（快速连点由第 2 步的锁兜底，见第 7 步）。失败路径（`START_TIMEOUT` / 动态端口未报告）**只回写核验记录**：POSIX 可使用仍存活的直接 child；Windows 仅接受同 launchId/launchStartedAt 的有效 lease 并经 PID 校验后记录，不再从端口占用者或相同 argv 猜测本次归属。无法证明时只记脱敏日志，进程保留不杀、不自动认领，用户可确认后显式「接管」。
+7. 释放锁（**M5.5：锁保持到 run 记录写入完成之后**——启动窗口内并发 start 被锁挡下，`--port 0`（无占用探测）亦被覆盖，防双开；轮询在锁内进行）；等待 readiness/HTTP（500ms 检查与文件唤醒，从 spawn 起共享 150s）。就绪 → `running`；超时 → 返回 `START_TIMEOUT` + 日志尾部（此时**不杀进程**，交由用户查看日志后决定；进程可能仍在后台最终就绪）。
 8. `unref()` child 句柄，宿主随时可安全退出。
-9. **M4 动态端口（`--port 0`）**：第 7 步之前先轮询日志（仅解析 `logStartBytes` 之后的追加内容，排除历史实例干扰）匹配 `dsh web: http://127.0.0.1:<port>` URL 行（真实 dsh 绑定后打印实际端口；port 0 占位行跳过），发现后**回填 run 记录实际端口**再按常规探活；30s 未发现 → `START_TIMEOUT`。status 遇 port 0 占位记录同样尝试回填（自愈），回填前对外报 `port:null` + `requestedPort:0`、状态 `starting`。**M13**：同一轮日志扫描同时捕获完整 `dsh web: <url>` 行（含 token query）写入 run 记录 `launchUrl`（固定端口实例同样捕获，见第 6/7 步）。
+9. **M4 动态端口（`--port 0`）**：第 7 步之前先轮询日志（仅解析 `logStartBytes` 之后的追加内容，排除历史实例干扰）匹配 `dsh web: http://127.0.0.1:<port>` URL 行（真实 dsh 绑定后打印实际端口；port 0 占位行跳过），发现后**回填 run 记录实际端口**再按常规探活；共享 150s 截止前仍未发现 → `START_TIMEOUT`（发现后不另起就绪预算）。status 遇 port 0 占位记录同样尝试回填（自愈），回填前对外报 `port:null` + `requestedPort:0`、状态 `starting`。**M13**：同一轮日志扫描同时捕获完整 `dsh web: <url>` 行（含 token query）写入 run 记录 `launchUrl`（固定端口实例同样捕获，见第 6/7 步）。
 
 **stop**
 
 1. status → `stopped` 则返回 `ALREADY_STOPPED`；status → `external` 则返回 `EXTERNAL_UNMANAGED`（外部实例不属于本扩展管理范围，绝不 taskkill）。
 2. 抢锁。
-3. 优雅路径（dsh-lifecycle 插件存在时）：先探测 `/_lifecycle/health`（1.5s）判定插件可用；可用则 `POST http://127.0.0.1:<port>/_lifecycle/shutdown`（2s 连接超时）→ 轮询端口关闭 ≤ 3s；关闭则记为 `stopMethod:'graceful'` 并跳过第 4 步。插件不可达则直接走第 4 步（不浪费一次 POST；SPA fallback 对未匹配路径也返回 200，不能以状态码判定插件存在）。
+3. 优雅路径：有效且同身份 readiness 可确认插件；否则探测 `/_lifecycle/health`（1.5s），失败时有界重试一次。确认插件后 `POST http://127.0.0.1:<port>/_lifecycle/shutdown`（2s 连接超时），直接进入第 5 步统一等待 PID 与端口退出；没有独立 3s 端口关门阈值。不能以 SPA 200 判定插件存在。
 4. 强制路径（插件缺失或优雅路径超时）：Windows 为 `taskkill /PID <pid> /T /F`；**M4 POSIX 为 SIGTERM（进程组，detached 起组）→ 3s 内未退出 SIGKILL 兜底**；均记为 `stopMethod:'force'`（语义不变：优雅仅指 lifecycle 插件路径）。PID 取自 run 记录；先做 PID 复用校验，失败则拒杀并报 `STOP_FAILED`。
-5. 等待端口关闭且 PID 退出 ≤ 10s；PID 仍活着则复核身份并强制终止，标记 `stopMethod:'force'`，再等 ≤ 3s；仍未完全退出 → `STOP_FAILED`。
+5. 优雅请求后统一等待端口关闭且 PID 退出 ≤ 10s；PID 仍活着则复核身份并强制终止，标记 `stopMethod:'force'`，再等 ≤ 3s；仍未完全退出 → `STOP_FAILED` 并保留记录。成功清除 run/PID，并仅删除匹配本次 launchId/launchStartedAt/PID 的 ready 租约；无新实例/外来租约删除权限。
 6. 删除 run 记录与 pid 文件，释放锁。stop 响应的 result 附带 `stopMethod`（graceful/force）。
 
 **restart**

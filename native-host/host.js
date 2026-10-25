@@ -5,9 +5,8 @@
 //   ping / status / start / stop / restart / adopt / logs
 // 单文件、纯 Node CJS、零第三方依赖、Node >= 18。
 // M3：logs 动作读取日志文件尾部/分页（design §6.3 logs）。
-// M2：status 附 lifecycle/health 富状态；stop 先探 /_lifecycle/health 判定插件可用，
-//   可用才走优雅停（POST /_lifecycle/shutdown + 3s 端口关闭 -> stopMethod:'graceful'），
-//   否则 taskkill（stopMethod:'force'）。
+// M2：status 附 lifecycle/health；stop 用同身份 lease 或有界 health 重试确认插件，
+//   POST shutdown 后共等 PID+端口 10s，超时复核后 force（stopMethod 据真实路径）。
 // ============================================================================
 // 协议摘要（与 docs/design.md §6.2 一致）
 // ----------------------------------------------------------------------------
@@ -66,6 +65,8 @@ const DEFAULT_PORT = 3080;
 const DEFAULT_HOST = '127.0.0.1';
 const MAX_MSG_BYTES = 1024 * 1024; // 入站帧长度上限 1MB
 const WATCHDOG_MS = 15000; // 15 秒无消息看门狗
+const START_TIMEOUT_MS = 150000; // All launch modes share one spawn-relative readiness deadline.
+const LAUNCH_URL_TIMEOUT_MS = 5000; // Only URL capture may extend that deadline.
 const LOG_TAIL_LINES = 20; // 错误响应附带的日志尾部行数
 const ACTIONS = ['ping', 'status', 'start', 'stop', 'restart', 'adopt', 'logs', 'sessions'];
 
@@ -135,6 +136,24 @@ function readReadiness(expected, skipPidCommandCheck = false) {
   } catch (_) { return null; }
 }
 
+// Forced exits cannot run the publisher's disposer. Remove only the stopped launch's
+// exact identity; freshness/liveness are deliberately irrelevant for stale cleanup.
+function removeOwnedReadiness(expected) {
+  if (!expected || !/^[a-f0-9]{32}$/.test(expected.launchId || '')
+    || !Number.isSafeInteger(expected.launchStartedAt)
+    || !Number.isInteger(expected.pid) || expected.pid <= 0) return;
+  try {
+    if (fs.statSync(READY_FILE).size > 8192) return;
+    const signal = JSON.parse(fs.readFileSync(READY_FILE, 'utf8'));
+    if (signal && signal.schemaVersion === 1 && signal.launchId === expected.launchId
+      && signal.launchStartedAt === expected.launchStartedAt && signal.pid === expected.pid) {
+      fs.unlinkSync(READY_FILE);
+    }
+  } catch (err) {
+    if (err.code !== 'ENOENT') log('清理本次就绪文件失败: ' + err.message);
+  }
+}
+
 function readinessEnv(v) {
   return {
     ...process.env,
@@ -175,10 +194,24 @@ function testMode() {
   return process.env.DSH_MANAGER_TEST_MODE === '1';
 }
 
+// Short budgets are environment-only test hooks; payloads never control them.
+function testTimeout(name, fallback) {
+  if (!testMode()) return fallback;
+  const raw = process.env['DSH_MANAGER_' + name + '_TIMEOUT_MS'];
+  if (typeof raw !== 'string' || !/^\d+$/.test(raw)) return fallback;
+  const value = Number(raw);
+  return Number.isSafeInteger(value) && value > 0 && value <= fallback ? value : fallback;
+}
+
+// Diagnostics must never expose browser launch credentials (including exception text).
+function redactTokens(text) {
+  return String(text).replace(/([?&]token=)[^\s&#"'<>]+/gi, '$1[REDACTED]');
+}
+
 // 日志只写 stderr，带时间戳前缀；stdout 只用于协议应答。
 function log(msg) {
   const ts = new Date().toISOString();
-  process.stderr.write(`[${ts}] ${msg}\n`);
+  process.stderr.write(`[${ts}] ${redactTokens(msg)}\n`);
 }
 
 function sleep(ms) {
@@ -299,6 +332,12 @@ function removeRunRecord() {
   }
 }
 
+function sameRunIdentity(a, b) {
+  return !!a && !!b && a.pid === b.pid && a.launchId === b.launchId
+    && a.launchStartedAt === b.launchStartedAt
+    && (a.launchId || (a.startedAt === b.startedAt && a.binPath === b.binPath));
+}
+
 function removeRunRecordSafe() {
   try {
     removeRunRecord();
@@ -339,7 +378,7 @@ function pidAlive(pid) {
 //   Linux：/proc/<pid>/cmdline；macOS：ps -p <pid> -o args=。
 //   本环境可能 EPERM，必须 try/catch：任何异常一律静默跳过（视为通过）；
 //   DSH_MANAGER_PID_CHECK=0 时直接跳过。
-function pidLooksLikeDsh(pid, binPath) {
+function pidLooksLikeDsh(pid, binPath, timeoutMs = 5000) {
   if (testMode() && process.env.DSH_MANAGER_PID_CHECK === '0') return true;
   if (!IS_WIN) {
     // POSIX：读命令行；读取失败按通过处理（权限等）
@@ -351,7 +390,7 @@ function pidLooksLikeDsh(pid, binPath) {
         const r = spawnSync('ps', ['-p', String(pid), '-o', 'args='], {
           encoding: 'utf8',
           windowsHide: true,
-          timeout: 5000,
+          timeout: timeoutMs,
           stdio: ['ignore', 'pipe', 'ignore'],
         });
         if (!r.error && r.status === 0) cmd = (r.stdout || '').trim();
@@ -369,7 +408,7 @@ function pidLooksLikeDsh(pid, binPath) {
     const r = spawnSync('tasklist', ['/FI', 'PID eq ' + pid, '/FO', 'CSV', '/NH'], {
       encoding: 'utf8',
       windowsHide: true,
-      timeout: 5000,
+      timeout: timeoutMs,
       stdio: ['ignore', 'pipe', 'ignore'],
     });
     if (r.error) {
@@ -576,12 +615,13 @@ function portConnectable(port, timeoutMs) {
 // M2 优雅停机预留：POST /_lifecycle/shutdown（Content-Length:0，2s 超时）。
 // 注意：dsh 的 SPA fallback 对未匹配路径也返回 200，因此不能用状态码判断
 // 插件是否存在——是否成功由后续「轮询端口关闭」判定。
-function postShutdown(port) {
+function postShutdown(port, timeoutMs = 2000) {
   return new Promise((resolve) => {
     let settled = false;
     const finish = () => {
       if (settled) return;
       settled = true;
+      if (req) req.destroy();
       resolve();
     };
     let req;
@@ -592,7 +632,7 @@ function postShutdown(port) {
         path: '/_lifecycle/shutdown',
         method: 'POST',
         headers: { 'Content-Length': '0', Connection: 'close' },
-        timeout: 2000,
+        timeout: timeoutMs,
         agent: false,
       }, (res) => {
         res.resume(); // 丢弃响应体（状态码不可用于判定）
@@ -619,16 +659,15 @@ async function waitPortClosed(port, totalMs, intervalMs) {
   return !(await portConnectable(port, 800));
 }
 
-// 轮询「进程退出或端口关闭」（用于 taskkill 之后：进程死亡即可视为成功）
+// PID AND listener must both be gone; port 0 is an unknown-port placeholder.
 async function waitProcessStopped(pid, port, totalMs, intervalMs) {
   const deadline = Date.now() + totalMs;
   for (;;) {
-    if (!pidAlive(pid) && !(await portConnectable(port, 800))) return true;
-    const remaining = deadline - Date.now();
-    if (remaining <= 0) break;
-    await sleep(Math.min(intervalMs, remaining));
+    const remaining = Math.max(0, deadline - Date.now());
+    if (!pidAlive(pid) && (port <= 0 || !(await portConnectable(port, Math.max(1, Math.min(800, remaining)))))) return true;
+    if (Date.now() >= deadline) return false;
+    await sleep(Math.min(intervalMs, deadline - Date.now()));
   }
-  return !pidAlive(pid) && !(await portConnectable(port, 800));
 }
 
 // ---------------------------------------------------------------------------
@@ -1412,7 +1451,7 @@ function readLogTail(lines) {
   try {
     const raw = fs.readFileSync(LOG_FILE, 'utf8');
     const arr = raw.split(/\r?\n/);
-    return arr.slice(-n).join('\n');
+    return redactTokens(arr.slice(-n).join('\n'));
   } catch (err) {
     return ''; // 日志文件不存在等
   }
@@ -1478,13 +1517,14 @@ function discoverLaunchUrlFromLog(byteOffset) {
 // M13：等待 launchUrl 出现（写 run 记录前调用）。动态端口场景端口行已出现
 // （端口就是从该行解析的）；固定端口场景 URL 行在 loader settled 后才打印、
 // 可能晚于 HTTP 就绪——短重试最多 timeoutMs（默认 5000，间隔 500ms）兜底。
-async function captureLaunchUrl(logStartBytes, timeoutMs = 5000) {
+async function captureLaunchUrl(logStartBytes, timeoutMs = LAUNCH_URL_TIMEOUT_MS) {
   const deadline = Date.now() + timeoutMs;
   for (;;) {
     const url = discoverLaunchUrlFromLog(logStartBytes);
     if (url !== null) return url;
-    if (Date.now() >= deadline) return null;
-    await sleep(500);
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) return null;
+    await sleep(Math.min(500, remaining));
   }
 }
 
@@ -1618,6 +1658,7 @@ async function computeStatus(fastReadiness = false) {
   if (rec) {
     if (!pidAlive(rec.pid)) {
       log('run 记录指向的 PID 不存在，清理残留记录');
+      removeOwnedReadiness(rec);
       removeRunRecordSafe();
     } else if (fastReadiness && (readiness = readReadiness(rec, true))) {
       // 只读 status：新鲜租约已绑定本次启动的 ID、PID 与端口，无须每轮启动 tasklist。
@@ -1780,8 +1821,13 @@ async function startDshCore(v, adoptedReplay) {
     readyWatch = watchReadiness();
     // 记录 spawn 时刻的日志字节偏移（LOG_FILE 可能尚不存在 -> 0）
     try { logStartBytes = fs.statSync(LOG_FILE).size; } catch (e) { logStartBytes = 0; }
-    // spawn（POSIX 直接 spawn；Windows 隐藏控制台载体，见 spawnDsh 注释）
+    // Start the ONE deadline before spawn; carrier/discovery/readiness share it.
+    const spawnStartedAt = Date.now();
+    const timeoutMs = testTimeout('START', START_TIMEOUT_MS);
+    const deadline = spawnStartedAt + timeoutMs;
+    const phase = (name) => log(`start phase=${name} mode=${launchSpec.launchMode} elapsedMs=${Date.now() - spawnStartedAt}`);
     child = spawnDsh(launchSpec, v);
+    phase('spawn');
     if (!child || !child.pid) {
       throw new AppError('INTERNAL', IS_WIN
         ? 'dsh 载体（wscript）启动失败，未获得进程'
@@ -1791,51 +1837,67 @@ async function startDshCore(v, adoptedReplay) {
     if (IS_WIN) {
       const early = await Promise.race([
         new Promise((res) => child.once('exit', (code) => res(code))),
-        sleep(2000).then(() => null),
+        sleep(Math.max(0, Math.min(2000, deadline - Date.now()))).then(() => null),
       ]);
       if (early !== null && early !== 0) {
         throw new AppError('INTERNAL', 'dsh 载体（wscript）启动失败，请检查系统组件后重试');
       }
     }
-    // M4 动态端口（--port 0）：先轮询日志 URL 行发现实际端口（最长 30s），
-    // 再按常规轮询该端口探活；发现超时 -> START_TIMEOUT + logTail（不杀进程）。
+    let verifiedReadinessPid = null;
+    const readLaunchReadiness = (port) => {
+      const expected = { ...v, port, binPath: bin };
+      // Cheap lease checks first. Query a candidate's command only once, bounded by
+      // the remaining launch budget; polling never repeats Windows tasklist.
+      let signal = readReadiness(expected, true);
+      if (signal && signal.pid !== verifiedReadinessPid) {
+        const remaining = deadline - Date.now();
+        if (remaining <= 0 || !pidLooksLikeDsh(signal.pid, bin, Math.min(5000, remaining))) return null;
+        verifiedReadinessPid = signal.pid;
+        signal = readReadiness({ ...expected, pid: verifiedReadinessPid }, true);
+      }
+      return signal;
+    };
     let targetPort = v.port;
     if (v.port === 0) {
-      const deadline = Date.now() + 30000;
-      for (;;) {
-        const signal = readReadiness({ ...v, binPath: bin });
+      targetPort = null;
+      while (Date.now() < deadline) {
+        const signal = readLaunchReadiness(0);
         targetPort = signal ? signal.port : discoverPortFromLog(logStartBytes);
         if (targetPort !== null) break;
-        if (Date.now() >= deadline) break;
-        await readyWatch.wait(500);
+        await readyWatch.wait(Math.max(1, Math.min(500, deadline - Date.now())));
       }
       if (targetPort === null) {
-        // M5.5：尽力回写占位记录（port 0，status 自愈回填），恢复失败期可停止性
-        writeBestEffortRecord(v, bin, version, null, 0, logStartBytes, adoptedReplay, child, launchSpec);
-        throw new AppError('START_TIMEOUT', 'dsh 在 30 秒内未报告动态端口（--port 0），进程已保留，请查看日志', { needLogTail: true });
+        phase('port-timeout');
+        writeBestEffortRecord(v, bin, version, verifiedReadinessPid, 0, logStartBytes, adoptedReplay, child, launchSpec);
+        throw new AppError('START_TIMEOUT', `dsh 在 ${Math.round(timeoutMs / 1000)} 秒内未报告动态端口（--port 0），进程已保留，请查看日志`, { needLogTail: true });
       }
-      log('动态端口已发现: ' + targetPort);
+      phase('port-discovered');
     }
-    // 轮询探活（500ms 间隔；npx 首次冷下载放宽至 60s，常规 30s）；超时 -> START_TIMEOUT + logTail（不杀进程）
-    const timeoutMs = (launchSpec && launchSpec.launchMode === 'npx') ? 60000 : 30000;
-    const deadline = Date.now() + timeoutMs;
     let readiness = null;
     let ready = false;
-    do {
-      readiness = readReadiness({ ...v, port: targetPort, binPath: bin });
+    while (Date.now() < deadline) {
+      readiness = readLaunchReadiness(targetPort);
       if (readiness) ready = readiness.state === 'ready';
-      else ready = await httpProbe(targetPort, 1200);
-      if (ready) break;
-      await readyWatch.wait(Math.max(1, Math.min(500, deadline - Date.now())));
-    } while (Date.now() < deadline);
+      else {
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) break;
+        ready = await httpProbe(targetPort, Math.min(1200, remaining));
+      }
+      if (ready && Date.now() <= deadline) break;
+      ready = false;
+      if (Date.now() >= deadline) break;
+      await readyWatch.wait(Math.min(500, deadline - Date.now()));
+    }
     if (!ready) {
-      // M5.5：尽力回写记录，让实例仍可经扩展停止（若端口在听可反查到 pid）
-      writeBestEffortRecord(v, bin, version, null, targetPort, logStartBytes, adoptedReplay, child, launchSpec);
+      phase('ready-timeout');
+      // Only verified PIDs can be retained for later management; never kill on timeout.
+      writeBestEffortRecord(v, bin, version, verifiedReadinessPid, targetPort, logStartBytes, adoptedReplay, child, launchSpec);
       const extraTip = (launchSpec && launchSpec.launchMode === 'npx')
         ? '（NPX 模式首次运行需联网下载依赖，可能耗时较长）'
         : '';
       throw new AppError('START_TIMEOUT', `dsh 在 ${Math.round(timeoutMs / 1000)} 秒内未就绪（端口 ${targetPort} 无响应）${extraTip}，进程已保留，请查看日志`, { needLogTail: true });
     }
+    phase('ready');
     // M5.5 Windows：端口就绪后反查真实 PID（载体链路下 wscript 的 pid 不是 dsh 的 pid）
     let pid = readiness ? readiness.pid : child.pid;
     if (IS_WIN && !readiness) {
@@ -1851,10 +1913,13 @@ async function startDshCore(v, adoptedReplay) {
     // 兜底（5s）；动态端口场景端口行已出现，首次即命中。捕获失败不阻塞启动
     // （launchUrl=null，扩展回退裸 URL）。adopted 重放同样捕获本进程新打印的 URL
     // （新进程新 token，不是复制旧记录，§12.3）。
-    const launchUrl = await captureLaunchUrl(logStartBytes);
+    phase('pid-resolved');
+    const launchUrl = await captureLaunchUrl(logStartBytes, testTimeout('LAUNCH_URL', LAUNCH_URL_TIMEOUT_MS));
+    phase(launchUrl ? 'url-captured' : 'url-unavailable');
     const rec = makeRunRecord(v, bin, version, pid, targetPort, logStartBytes, adoptedReplay, launchUrl, launchSpec);
     writeRunRecord(rec);
     writePidFile(pid);
+    phase('record-written');
   } finally {
     if (readyWatch) readyWatch.close();
     releaseLock(); // M5.5：锁保持到记录写入完成（防启动窗口并发双开，design §6.3 第 7 步）
@@ -1862,45 +1927,22 @@ async function startDshCore(v, adoptedReplay) {
   return buildResult('running', readRunRecord());
 }
 
-// M5.5：失败路径（START_TIMEOUT / 动态端口未报告）尽力回写 run 记录，
-// 保证实例仍可经扩展停止：
-//   POSIX：pid 已知（直接 spawn），立即写（port 0 占位由 status 自愈回填）。
-//   Windows：载体链路 pid 未知——port 已知时经端口表反查；port 未知（动态端口
-//   未报告）时经进程表匹配 bin+`--port 0`（尽力而为）；匹配失败仅记日志——
-//   实例可能仍在运行，刷新 popup 后可按 external「接管」停止。
+// M5.5：失败路径只保留可归属于本次启动的活 PID，不杀进程。
+// A listener or identical argv can belong to an external launch. On Windows the
+// carrier PID is NOT dsh: only a previously command-checked same-launch lease can
+// prove ownership. POSIX has the directly spawned child PID. No unbounded process
+// enumeration is allowed to extend the readiness deadline on the failure path.
 function writeBestEffortRecord(v, bin, version, pid, port, logStartBytes, adoptedReplay, child, launchSpec = null) {
-  if (IS_WIN) {
-    let tpid = port > 0 ? findPidByPort(port) : null;
-    if (!tpid) tpid = findDshPidByCmdline(bin);
-    if (!tpid) {
-      log(`失败路径未能定位 dsh 进程（port=${port}）——实例可能仍在运行，刷新 popup 后可「接管」`);
-      return;
-    }
-    writeRunRecord(makeRunRecord(v, bin, version, tpid, port, logStartBytes, adoptedReplay, null, launchSpec));
-    writePidFile(tpid);
-    log(`失败路径已尽力回写记录 pid=${tpid} port=${port}`);
+  const signal = IS_WIN && pid ? readReadiness({ ...v, pid, port, binPath: bin }, true) : null;
+  const ownedPid = IS_WIN ? (signal && signal.pid) : (child && child.pid);
+  if (!ownedPid || !pidAlive(ownedPid)) {
+    log(`失败路径未能核验本次 dsh 进程（port=${port}）——进程未被终止，可在确认后显式「接管」`);
     return;
   }
-  if (child && child.pid) {
-    writeRunRecord(makeRunRecord(v, bin, version, child.pid, port, logStartBytes, adoptedReplay, null, launchSpec));
-    writePidFile(child.pid);
-    log(`失败路径已回写记录 pid=${child.pid} port=${port}`);
-  }
-}
-
-// 进程表匹配：bin 路径 + `--port 0` 的存活 node 进程（动态端口未报告时的尽力反查；
-// 同 bin 同 `--port 0` 的外部实例才可能误配，且写记录前锁内已复查无记录，风险可控）
-function findDshPidByCmdline(bin) {
-  const searchKey = (typeof bin === 'string' && bin.startsWith('npx:')) ? '@deepseek-ai/dsh' : String(bin);
-  for (const p of listNodeProcesses()) {
-    if (!pidAlive(p.pid)) continue;
-    const cmd = p.cmdline || '';
-    if (!cmd.includes(searchKey)) continue;
-    if (!/(?:^|\s)--port(?:=|\s+)0(?=\s|$)/.test(cmd)) continue;
-    if (!pidLooksLikeDsh(p.pid, bin)) continue;
-    return p.pid;
-  }
-  return null;
+  writeRunRecord(makeRunRecord(v, bin, version, ownedPid, signal ? signal.port : port,
+    logStartBytes, adoptedReplay, null, launchSpec));
+  writePidFile(ownedPid);
+  log(`失败路径已回写核验记录 pid=${ownedPid} port=${signal ? signal.port : port}`);
 }
 
 // 端口表反查 + 一次 200ms 短重试（HTTP 就绪与 netstat 可见之间偶发亚毫秒延迟）
@@ -1951,77 +1993,89 @@ async function actionStart(payload) {
 }
 
 // 停止核心逻辑（stop / restart 共用）：
-// 端口在听时先 getHealth 判定插件可用 -> 可用才 POST shutdown + 等 3s（graceful）；
-// 不可达或 3s 未关 -> taskkill（force）。端口本来没听（starting）直接 taskkill（force）。
+// 同身份 lease / 最多两次 health -> POST + 一次10s PID/端口等待；再复核并 force。
+// 无插件或端口从未打开（starting）直接 force，不能把未监听误报为 graceful。
 // 返回 { status: 'stopped'|'already-stopped', method: 'graceful'|'force' }。
 async function stopCore(rec) {
   const locked = await acquireLock();
   if (!locked) throw new AppError('BUSY', '另一个操作正在进行，请稍后重试');
+  const stopStartedAt = Date.now();
+  const phase = name => log(`stop phase=${name} elapsedMs=${Date.now() - stopStartedAt}`);
   try {
     const rec2 = readRunRecord();
-    if (!rec2 || rec2.pid !== rec.pid || !pidAlive(rec2.pid)) {
-      // 记录已消失或 PID 已死：视作已停止（顺带清理）
+    if (rec2 && !sameRunIdentity(rec2, rec)) {
+      throw new AppError('STOP_FAILED', '实例记录已被新的启动替换，拒绝停止或清理新实例', { needLogTail: true });
+    }
+    if (!rec2 || !pidAlive(rec2.pid)) {
+      // Do not let a stale stop request delete a replacement launch or its lease.
+      removeOwnedReadiness(rec);
       if (rec2) removeRunRecordSafe();
       return { status: 'already-stopped', method: 'force' };
     }
-    // PID 复用防护：命令行不含 dsh/bin 关键字 -> 拒杀（design §6.3 stop 第 4 步）
     if (!pidLooksLikeDsh(rec2.pid, rec2.binPath)) {
       throw new AppError('STOP_FAILED', `PID ${rec2.pid} 不是 dsh 进程（疑似 PID 已被复用），拒绝强制终止`, { needLogTail: true });
     }
-    // 3. M2 优雅尝试：先探测 /_lifecycle/health 判定插件可用性（design §6.3 stop 第 3 步）
-    //    端口本来就没开（starting 状态）时跳过优雅路径，直接强制终止，
-    //    否则「端口从未打开」会被误判为「已优雅关闭」而放走还活着的进程。
-    let method = 'force';
-    // M4：port 0（动态端口未回填）无法探活/优雅停，直接 taskkill（force）
-    const wasListening = rec2.port > 0 && await portConnectable(rec2.port, 1200);
-    if (wasListening) {
-      const health = await getHealth(rec2.port, 1500);
-      if (health !== null) {
-        // 插件可用：POST shutdown（不能看状态码：SPA fallback 一律 200）
-        await postShutdown(rec2.port);
-        // POST 后轮询端口关闭最长 3s -> 关闭记 graceful，跳过 taskkill
-        const closed = await waitPortClosed(rec2.port, 3000, 200);
-        if (closed) {
-          method = 'graceful';
-        } else {
-          // 4. 优雅路径超时 -> 强制终止（Windows taskkill / POSIX SIGTERM→SIGKILL）
-          const k = await terminateProcess(rec2.pid);
-          if (!k.ok && pidAlive(rec2.pid)) {
-            throw new AppError('STOP_FAILED', '强制终止执行失败: ' + (k.error || ('退出码 ' + k.code)), { needLogTail: true });
-          }
+    // A live same-launch lease already proves the lifecycle plugin is mounted.
+    // Legacy/no-lease plugins get at most TWO health attempts in a bounded window.
+    const readiness = readReadiness(rec2, true);
+    if (readiness && rec2.port === 0) rec2.port = readiness.port;
+    let pluginAvailable = !!readiness;
+    const wasListening = pluginAvailable || (rec2.port > 0 && await portConnectable(rec2.port, 1200));
+    if (!pluginAvailable && wasListening) {
+      const healthDeadline = Date.now() + 3250;
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const remaining = healthDeadline - Date.now();
+        if (remaining <= 0) break;
+        const health = await getHealth(rec2.port, Math.min(1500, remaining));
+        // Old plugins may omit identity fields. If present, never accept a different PID/port.
+        if (health && (health.pid === undefined || health.pid === rec2.pid)
+          && (health.port === undefined || health.port === rec2.port)) {
+          pluginAvailable = true;
+          break;
         }
-      } else {
-        // 插件不可达（health null）：跳过无效 POST，直接强制终止
+        if (attempt === 0 && Date.now() < healthDeadline) await sleep(Math.min(250, healthDeadline - Date.now()));
+      }
+    }
+    phase(pluginAvailable ? 'plugin-confirmed' : 'plugin-unavailable');
+    let method = 'force';
+    let stopped = false;
+    if (pluginAvailable) {
+      const shutdownDeadline = Date.now() + testTimeout('STOP', 10000);
+      await postShutdown(rec2.port, Math.max(1, Math.min(2000, shutdownDeadline - Date.now())));
+      phase('shutdown-sent');
+      stopped = await waitProcessStopped(rec2.pid, rec2.port, Math.max(0, shutdownDeadline - Date.now()), 200);
+      if (stopped) method = 'graceful';
+    }
+    if (!stopped) {
+      // No 3-second listener-only shortcut: only the shared disposal deadline
+      // triggers force, with a fresh PID/record check immediately before killing.
+      const current = readRunRecord();
+      if (current && !sameRunIdentity(current, rec2)) {
+        throw new AppError('STOP_FAILED', '实例记录已变更，拒绝强制终止', { needLogTail: true });
+      }
+      if (pidAlive(rec2.pid)) {
+        if (!pidLooksLikeDsh(rec2.pid, rec2.binPath)) {
+          throw new AppError('STOP_FAILED', `PID ${rec2.pid} 已不属于 dsh，拒绝强制终止`, { needLogTail: true });
+        }
         const k = await terminateProcess(rec2.pid);
         if (!k.ok && pidAlive(rec2.pid)) {
           throw new AppError('STOP_FAILED', '强制终止执行失败: ' + (k.error || ('退出码 ' + k.code)), { needLogTail: true });
         }
-      }
-    } else {
-      const k = await terminateProcess(rec2.pid);
-      if (!k.ok && pidAlive(rec2.pid)) {
-        throw new AppError('STOP_FAILED', '强制终止执行失败: ' + (k.error || ('退出码 ' + k.code)), { needLogTail: true });
-      }
-    }
-    // 5. 等待端口和 PID 都退出。新 dsh 的端口先于进程关闭；Windows 下
-    //    旧进程持有日志句柄时立即重启会使 cmd 重定向失败，不能只等端口。
-    let stopped = await waitProcessStopped(rec2.pid, rec2.port, 10000, 300);
-    if (!stopped && pidAlive(rec2.pid)) {
-      if (!pidLooksLikeDsh(rec2.pid, rec2.binPath)) {
-        throw new AppError('STOP_FAILED', `PID ${rec2.pid} 已不属于 dsh，拒绝强制终止`, { needLogTail: true });
-      }
-      const k = await terminateProcess(rec2.pid);
-      if (!k.ok && pidAlive(rec2.pid)) {
-        throw new AppError('STOP_FAILED', '退出清理失败: ' + (k.error || ('退出码 ' + k.code)), { needLogTail: true });
+        phase('forced');
       }
       method = 'force';
-      stopped = await waitProcessStopped(rec2.pid, rec2.port, 3000, 200);
+      stopped = await waitProcessStopped(rec2.pid, rec2.port, testTimeout('FORCE_STOP', 3000), 200);
     }
     if (!stopped) {
       throw new AppError('STOP_FAILED', `dsh 进程 ${rec2.pid} 或端口 ${rec2.port} 未退出`, { needLogTail: true });
     }
-    // 6. 成功：删除 run 记录与 pid 文件
+    const current = readRunRecord();
+    if (current && !sameRunIdentity(current, rec2)) {
+      throw new AppError('STOP_FAILED', '停止期间实例记录已变更，保留新记录', { needLogTail: true });
+    }
+    removeOwnedReadiness(rec2);
     removeRunRecord();
+    phase('stopped-' + method);
     return { status: 'stopped', method };
   } finally {
     releaseLock();
@@ -2339,7 +2393,7 @@ async function handleRequest(req) {
     return { id, ok: true, result, error: null };
   } catch (err) {
     if (err instanceof AppError) {
-      const e = { code: err.code, message: err.message };
+      const e = { code: err.code, message: redactTokens(err.message) };
       if (err.needLogTail || NEEDS_LOG_TAIL.has(err.code)) e.logTail = readLogTail();
       return { id, ok: false, result: err.result !== undefined ? err.result : null, error: e };
     }
@@ -2348,7 +2402,7 @@ async function handleRequest(req) {
     log('未预期异常: ' + stack);
     const summary = stack.split(/\r?\n/).slice(0, 3).join(' | ');
     const message = (err && err.message ? String(err.message) : String(err)) + ' @ ' + summary;
-    return { id, ok: false, result: null, error: { code: 'INTERNAL', message, logTail: readLogTail() } };
+    return { id, ok: false, result: null, error: { code: 'INTERNAL', message: redactTokens(message), logTail: readLogTail() } };
   }
 }
 
@@ -2443,7 +2497,7 @@ async function stdioMode() {
         throw err;
       }
       if (req === null) break; // stdin end/close -> 退出
-      disarmWatchdog(); // 处理期间不触发看门狗（start 最长可轮询 30s）
+      disarmWatchdog(); // 在途 start/restart 可超过15s；仅空闲读帧时武装
       const resp = await handleRequest(req);
       writeFrame(resp);
       armWatchdog(); // 响应写完后重新武装

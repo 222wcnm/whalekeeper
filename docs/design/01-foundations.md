@@ -187,6 +187,50 @@ npm 实测 `latest` / `next` = `0.2.0-rc.2`，`alpha` = `0.2.1-alpha.1`；本机
 
 ---
 
+### 2.1.3 `0.2.1-rc.2` 兼容性修复（2026-10-19 验收通过）
+
+本机全局 CLI 与 Desktop 运行时均已核验为 `0.2.1-rc.2`。默认 HTTP 回环入口的
+Service/Event、认证、公开 manifest 和主题属性仍兼容；旧 `0.2.0-rc.2` 验收不能
+直接作为新版本运行结论。此次修复包含既有缺陷，不把它们全部归因于 rc.2。
+
+- 启动：global / NPX / source 从 spawn 起共享 150 秒预算（动态端口发现不另起计时），
+  URL 捕获最多额外 5 秒；SW start/restart/stop 上限分别 210/240/60 秒。
+- 停止：有效、身份匹配的 readiness 可确认插件；否则健康探测有界重试一次。
+  shutdown 后统一等 PID 和端口退出 10 秒，超时复核 PID 再强制；退出后仅清理本次租约。
+- 插件：全部资源用 `ctx.effect` 显式托管、幂等逆序清理及失败回滚；修复多客户端
+  snapshot 覆盖广播基线、子会话 dispose 顺序造成的 SSE 陈旧摘要。
+- 扩展：会话行恢复只读；URL 精确比较有效端口；已有未认证页用经过校验的启动
+  URL 另开认证页，不覆盖原标签或草稿。认证查询只返回状态和端口，不传 token。
+- SSE：收到有效 snapshot 才进入 live，error 立即回退，5 秒无 snapshot 则重建，
+  15 秒退避且后台可重试；旧代回调无效。无可靠摘要时不从全页 StateDot 猜测计数，
+  失联不生成完成提醒。
+
+正式通过标准：生产源码单测/冒烟/浏览器基线零回归，真实 rc.2 连续三轮固定/动态
+端口启动、重启、优雅停止，至少一轮完整浏览器与真实 SSE 恢复；停止后 PID/监听/
+run/ready 全清。此前放宽等待、改 HTTP 的诊断副本不算正式通过。
+
+**验收通过（Windows / Node v24.19.0 / Chrome 155.0.8059.80）**：工作区扩展 0.3.2、
+配套插件 0.4.2。正式单测 **178/178，0 SKIP**（插件87/宿主29/扩展62，含真实
+Cordis 4.0.5），33 场景 smoke **428 PASS / 0 FAIL / 1 POSIX SKIP**；精确 npm
+CLI 0.2.1-rc.2 三轮原样隔离 E2E **196/196**，其中一轮完整浏览器 **121/121**。
+三轮共12个独立launch：固定/动态各 start→restart→stop，全部严格 graceful，
+无紧急force、无 PID/端口/run/ready/lock 残留。动作实测 start 4.99–8.00s、restart
+6.78–10.04s、stop 1.68–2.06s；共享150s边界另由 fake clock/stdio正式回归覆盖。
+真实浏览器撤销 live 122ms、hidden重连13.74s，waiting回退与completed恢复的
+HTTP/SSE/storage一致、无假完成。测试不调用模型，不修改日常profile/注册/当前实例。
+
+证据：`.e2e-current/run-mvec4ykk-17c724ee/report.json`、各轮 `report.json`、首轮
+`ui.log` 与 `ui/real-sse-recovery.json`；`verified-summary.json` 校验生产 host SHA-256
+与三轮相同（产物gitignored）。macOS/Firefox、TLS/IPv6/远程入口未新增运行覆盖。
+
+**2026-10-26 发布复审**：178 项单测、开发目录 smoke428、发布副本 smoke422
+（4 项预期跳过）、重新执行的三轮 E2E196 与 Chrome156 浏览器121全部通过。
+工具进程访问 AppData 的额外耗时经独立终端与同字节 D 盘副本对照定位，正式验收选用
+该隔离副本而未改生产源码或150s预算。证据根 `.e2e-current/run-mvo3y5wp-91931053/`，
+过程与适用边界见 `native-host/test/VERIFICATION.md`。
+
+---
+
 ## 3. 方案选型
 
 ### 3.1 为什么必须用 Native Messaging
@@ -317,7 +361,7 @@ npm 实测 `latest` / `next` = `0.2.0-rc.2`，`alpha` = `0.2.1-alpha.1`；本机
 | 状态 | 判定条件（宿主 status 动作） | 典型去向 |
 |------|------------------------------|----------|
 | `stopped` | 无 run 记录且未发现外部实例；或 PID 不存在/已死，端口无应答（清残留） | start |
-| `starting` | run 记录存在、PID 存活，但端口无应答（进程仍在加载依赖） | 轮询至 `running`（30s 超时→`error`） |
+| `starting` | run 记录存在、PID 存活，但尚未就绪 | 轮询至 `running`（本轮共享 150s 截止，超时保留已核验进程） |
 | `running` | run 记录存在、PID 存活、`GET /` 200 | stop / restart |
 | `stopping` | stop 已发出、端口尚未关闭 | 轮询至 `stopped`（10s 超时→强制 taskkill） |
 | `external` | 无 run 记录，但发现外部启动的 dsh web 进程（命令行含 dsh bin.js）且端口指纹探测通过（§6.6） | 展示 + 打开 UI + **接管**（adopt → running/managed，§6.7）；直接 stop/restart 返回 `EXTERNAL_UNMANAGED` |

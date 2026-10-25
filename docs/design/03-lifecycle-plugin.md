@@ -43,7 +43,7 @@ health 响应（v1 最小集；v2 扩展会话/作业等聚合字段）：
    - **请求头 `sec-fetch-site` 为 `cross-site` 时拒绝**（与官方 `isTrustedApiRequest` 对齐）；
    - **Origin 缺失或与 Host 同源**——由此扩展页面直接 fetch（带 `chrome-extension://` Origin）被拒，而「扩展 → 宿主 → HTTP」链路（宿主请求无 Origin）天然合规；
    - 方法白名单：shutdown 仅 POST、health 仅 GET，其余 405（附 `Allow` 头）。
-4. **生命周期**：两个 disposer 在插件 `apply` 返回的清理函数中统一释放（随 fiber 停止/更新自动摘除路由）。
+4. **生命周期（2026-10-18 修正）**：在创建资源前建立幂等清理并显式注册 `ctx.effect`，所有路由、监听、心跳、debounce、SSE 与 readiness 逐项纳入逆序释放；单项失败不阻断其他清理，部分挂载失败也回滚。不能只依赖普通 `function apply` 返回 disposer（Cordis 的构造调用不会收集该返回值）。shutdown 防重状态每挂载独立，卸载取消尚未执行的退出回调。以真实 Cordis 挂载→卸载→重挂验证，而非只直接调用 apply。下方骨架仅示意所有权；完整实现另含计时器/SSE/readiness及失败回滚。
 5. **富状态聚合（v2）**：通过 `ctx.get()` 只读宿主 Cordis 服务（会话数、活动作业、token 统计等）——只取叶子字段、构造最小自有对象，绝不序列化 live 服务对象（dsh 插件规范）。
 
 骨架示意（正式实现按 dsh 插件包规范补 Invariant/测试/README）：
@@ -67,8 +67,18 @@ function allow(req) {
 }
 
 export function apply(ctx) {
-  const dispose = [
-    ctx.webServer.register({ kind: 'exact', path: '/_lifecycle/health', handler: async (req, res) => {
+  const dispose = []
+  let disposed = false
+  const cleanup = () => {
+    if (disposed) return
+    disposed = true
+    for (const release of dispose.splice(0).reverse()) {
+      try { release() } catch { /* continue releasing peers */ }
+    }
+  }
+  ctx.effect(() => cleanup)
+  try {
+    dispose.push(ctx.webServer.register({ kind: 'exact', path: '/_lifecycle/health', handler: async (req, res) => {
       if (!allow(req) || req.method !== 'GET') { res.writeHead(req.method === 'GET' ? 403 : 405); res.end(); return }
       res.writeHead(200, { 'content-type': 'application/json' })
       res.end(JSON.stringify({
@@ -76,20 +86,23 @@ export function apply(ctx) {
         uptimeMs: Math.round(process.uptime() * 1000),
         port: ctx.webServer.port, nodeVersion: process.version,
       }))
-    }}),
-    ctx.webServer.register({ kind: 'exact', path: '/_lifecycle/shutdown', handler: async (req, res) => {
+    }}))
+    dispose.push(ctx.webServer.register({ kind: 'exact', path: '/_lifecycle/shutdown', handler: async (req, res) => {
       if (!allow(req) || req.method !== 'POST') { res.writeHead(req.method === 'POST' ? 403 : 405); res.end(); return }
       res.writeHead(202, { 'content-type': 'application/json' })
       res.end(JSON.stringify({ ok: true }), () => setImmediate(() => ctx.appExit(0)))
-    }}),
-  ]
-  return () => { for (const d of dispose) d() }
+    }}))
+  } catch (error) {
+    cleanup()
+    throw error
+  }
+  return cleanup // convenience only; effect above owns lifetime
 }
 ```
 
-### 7.4 与宿主的协作分工（M2）
+### 7.4 与宿主的协作分工（M2，rc.2 时序澄清）
 
-- **stop**：宿主先 POST `/_lifecycle/shutdown` → 端口关闭后继续等 PID 退出 ≤ 10s → 超时复核 PID 后回退 taskkill。
+- **stop**：同身份 lease 或有界 health 重试确认插件 → POST `/_lifecycle/shutdown` → PID 与端口共用 10s 排空截止 → 超时复核身份后 force；不得按端口另等 3s 后提前强杀。
 - **restart**：shutdown → 等 stopped → 用 run 记录的 `cmdline` 原样重放 spawn。插件**不自行 respawn**：插件进程内拿不到 profile 名（`cmdlineArgs` 只含 launcher 之后的内部参数，F12），而宿主恰好持有权威启动命令，职责归属清晰。
 - **status**：存活判定仍以「PID 存活 + 端口探活」为权威（插件缺失不能把 running 误判为 stopped）；`health` 仅作富状态补充（§4.2.6）。
 

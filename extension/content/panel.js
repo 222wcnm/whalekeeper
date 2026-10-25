@@ -22,12 +22,51 @@
 //   - 扩展重载/更新后旧脚本上下文失效（chrome.runtime.id 为空）→ 停止轮询并
 //     提示刷新页面，避免孤儿脚本永久误报红错；
 //   - 展开面板绝对定位在胶囊上方：胶囊位置不动，面板向上弹出；
-//   - M8/M8.1 徽标提醒（§8.9）：只读扫描会话状态标记（data-state 语义属性），页面
+//   - 徽标提醒（§8.9）：仅同源 SSE/HTTP 摘要计数，失联未知不伪造完成；页面
 //     后台时 工作完成/等待用户 → 经 SW 上报表栏「!」/「?」提醒；并上报工作中/等待
 //     计数（蓝 n 会话状态概览）；可见即清除。
 // ============================================================================
 (() => {
-  // ---- 指纹激活：仅 dsh Web UI 页面 ----
+  // 401 首页没有 DSH title，故只读认证 listener 必须先于指纹早退；普通本地页不注入面板。
+  let pageUrl;
+  try { pageUrl = new URL(window.location.href); } catch (_) { return; }
+  if (pageUrl.protocol !== 'http:' || !['127.0.0.1', 'localhost'].includes(pageUrl.hostname)
+    || pageUrl.username || pageUrl.password) return;
+  const pagePort = Number(pageUrl.port || 80);
+  if (!Number.isInteger(pagePort) || pagePort < 1 || pagePort > 65535) return;
+  if (!window.__dshManagerAuthListenerInstalled) {
+    window.__dshManagerAuthListenerInstalled = true;
+    chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+      if (!message || message.type !== 'dsh-auth-status' || !chrome.runtime.id
+        || !sender || sender.id !== chrome.runtime.id) return;
+      (async () => {
+        const ctrl = new AbortController();
+        let timer;
+        let authenticated = null;
+        try {
+          const timeout = new Promise((resolve) => {
+            timer = setTimeout(() => { ctrl.abort(); resolve(null); }, 1200);
+          });
+          // 只看状态，不读取正文/cookie，不接收或转发任何 token。
+          const resp = await Promise.race([
+            fetch(pageUrl.origin + '/', {
+              method: 'GET', credentials: 'same-origin', cache: 'no-store', redirect: 'error', signal: ctrl.signal,
+            }),
+            timeout,
+          ]);
+          if (resp && resp.status === 200) authenticated = true;
+          else if (resp && resp.status === 401) authenticated = false;
+          // 不读正文；取消未消费的流，避免首页响应保留连接。
+          if (resp && resp.body) await resp.body.cancel().catch(() => {});
+        } catch (_) { /* 断网/超时/重定向：未知，不能把旧页面当作已认证 */ }
+        finally { clearTimeout(timer); }
+        try { sendResponse({ authenticated, port: pagePort }); } catch (_) { /* 页面/扩展已卸载 */ }
+      })();
+      return true;
+    });
+  }
+
+  // ---- 指纹激活：仅 DSH 页面追加自有面板 ----
   if (!/deepseek\s*harness/i.test(document.title)) return;
   if (window.__dshManagerPanelInjected) return; // 防重复注入
   window.__dshManagerPanelInjected = true;
@@ -270,7 +309,6 @@
   // 「这个 dsh 归扩展管」——WSL/终端启动的实例同样满足注入指纹）。仅当扩展
   // 管理的实例正在运行且其端口与当前页面端口一致时，本面板才有控制权。
   function ownership() {
-    const pagePort = Number(window.location.port) || 0;
     const repPort = detail && Number(detail.port);
     return {
       repPort,
@@ -498,7 +536,7 @@
       return;
     }
     const dark = document.body.hasAttribute('data-ds-dark-theme');
-    const port = Number(window.location.port) || null;
+    const port = pagePort;
     chrome.storage.local.get({ webuiTheme: null }, (items) => {
       if (chrome.runtime.lastError) return; // SW/SW 上下文失效时静默跳过
       const prev = items.webuiTheme;
@@ -513,23 +551,9 @@
     attributeFilter: ['data-ds-dark-theme'],
   });
 
-  // ---- 徽标提醒「该点回来看看了」（design §8.9，M8；M8.1 徽标=会话状态层）----
-  // 只读扫描会话状态标记（webui 事实基线：StateDot 的 data-state 语义属性——
-  // 工作中 = svg[data-state="ongoing"]；等待用户 = [data-state="warning"]；
-  // 空闲/完成 = data-state="done"），页面隐藏时跟踪状态快照并上报**计数**
-  // （蓝 n = n 个会话工作中）：
-  //   waiting>0 → 'waiting'（紫「?」，优先级覆盖 done/working）；
-  //   working>0 → 'working'（蓝 n 常驻状态概览）；
-  //   工作 → 空闲（稳定 1.2s）→ 'done'（琥珀「!」事件提醒）；
-  //   空闲 → 'idle'（该 tab 无会话信号）。
-  // 页面重新可见即发 clear。只判定标记存在性与数量，不读取页面消息内容。
-  // **计数数据源（2026-08-24 修复，design §8.9 修订）**：优先同源服务端点
-  // GET /_manager/sessions（dsh-lifecycle 插件，与 popup「会话」区同一端点、同一
-  // 状态判定）——原实现扫描 webui 页面 DOM（data-state），而 webui 显示态相对
-  // 服务端事件流存在前段渲染延迟，会话完成/空闲的瞬间徽标会拿到旧计数（「徽标
-  // 蓝 2、popup 会话区进行中 1」类不一致）；端点不可用（插件未装/旧版/网络失败）
-  // 时才回退 DOM 扫描（历史行为；此时 popup 会话区为降级/隐藏路径，无「数字
-  // 不一致」用户可见面）。同实例多标签重复计数由 SW 按端口去重（background.js）。
+  // ---- 徽标提醒（§8.9 / rc.2）：SSE 优先、HTTP 摘要回退，不扫描全页 DOM ----
+  // waiting → 黄?，working（含活动子代理）→ 蓝 n；已知工作→稳定零计数1.2s→绿!。
+  // 页面可见或数据失联即 clear 并复位；未知绝不等同已完成。摘要字段与镜像协议不变。
   const ATTENTION_TICK_MS = 1000; // 隐藏页定时器被 Chrome 节流到 1Hz，取 1s 与节流上限对齐
   const ATTENTION_DEBOUNCE_MS = 1200; // 工作→空闲需稳定空态 1.2s（吸收 React 重渲染瞬时抖动）
   const ATT_SESSIONS_ENDPOINT = '/_manager/sessions';
@@ -541,40 +565,43 @@
   let attTimer = null;
   let attBusy = false;   // 端点快取在途：跳过重叠 tick（fetch 超时可 > 1s 周期）
 
-  // 服务端点计数（与 popup 会话区同源）；任何失败返回 null（调用方回退 DOM 扫描）
-  async function attCountsFromEndpoint() {
+  let pageStopped = false;
+
+  function validSummary(item) {
+    return item && typeof item === 'object' && typeof item.sessionId === 'string' && item.sessionId.length > 0
+      && ['working', 'waiting', 'completed', 'idle'].includes(item.state);
+  }
+
+  function validSnapshot(data) {
+    return data && data.ok === true && Array.isArray(data.items) && data.items.every(validSummary);
+  }
+
+  // 失败保持未知，不回退全页 DOM 扫描；超时覆盖请求与 JSON 解析。
+  async function attSnapshot() {
     const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), ATT_FETCH_TIMEOUT_MS);
+    let timer;
     try {
-      const resp = await fetch(ATT_SESSIONS_ENDPOINT, { signal: ctrl.signal, cache: 'no-store' });
-      if (!resp.ok) return null;
-      const data = await resp.json();
-      if (!data || data.ok !== true || !Array.isArray(data.items)) return null;
-      let working = 0;
-      let waiting = 0;
-      for (const it of data.items) {
-        if (!it || typeof it !== 'object') continue;
-        if (it.state === 'waiting') waiting += 1;
-        // M13.1 口径（design §8.10 M11 定稿）：有子代理运行的会话归入「进行中」
-        // （蓝 n）——父会话可能已 completed（「已停止」）但子代理仍在跑。
-        else if (it.state === 'working' || it.hasActiveChildren === true) working += 1;
-      }
-      return { working, waiting };
-    } catch (_) { /* 端点不可达/被拦截：回退 */ return null; }
+      const timeout = new Promise((resolve) => {
+        timer = setTimeout(() => { ctrl.abort(); resolve(null); }, ATT_FETCH_TIMEOUT_MS);
+      });
+      const request = async () => {
+        const resp = await fetch(ATT_SESSIONS_ENDPOINT, {
+          method: 'GET', credentials: 'same-origin', signal: ctrl.signal, cache: 'no-store',
+        });
+        if (!resp.ok) return null;
+        const data = await resp.json();
+        return validSnapshot(data) ? data : null;
+      };
+      return await Promise.race([request(), timeout]);
+    } catch (_) { return null; }
     finally { clearTimeout(timer); }
   }
 
-  // 计数快照：端点优先（同源一致），失败回退 webui DOM 扫描（插件未装/旧版）
-  async function attSnapshot() {
-    const ep = await attCountsFromEndpoint();
-    if (ep !== null) return ep;
-    let working = 0;
-    let waiting = 0;
-    try {
-      working = document.querySelectorAll('svg[data-state="ongoing"]').length;
-      waiting = document.querySelectorAll('[data-state="warning"]').length;
-    } catch (_) { /* 页面卸载中：按无标记处理 */ }
-    return { working, waiting };
+  function attReset() {
+    if (attActive) { attActive = false; attSend('clear'); }
+    attPhase = 'idle';
+    attIdleSince = 0;
+    attLastSig = '';
   }
 
   function attSend(op, kind, s) {
@@ -630,14 +657,16 @@
   // ---- M12 SSE 会话推送（design §8.10.1）：同源主动推送优先，1Hz 空轮询消除 ----
   // 仅依赖浏览器内建 EventSource；插件未装/旧版/断流时自动回退下述端点轮询路径。
   const SSE_ENDPOINT = '/_manager/events';
-  const SSE_ERR_LIMIT = 3; // 连续失败阈值：超过则关闭并回退（EventSource 会自动重连）
-  const SSE_RETRY_GAP_MS = 15000; // 失败后的重试间隔（防空转轰炸；实例重启自愈靠 visible tick）
+  const SSE_SNAPSHOT_TIMEOUT_MS = 5000;
+  const SSE_RETRY_GAP_MS = 15000;
   let sse = null;
-  let sseAlive = false;        // open 后未持续失败：attTick 跳过端点快取（0 轮询）
-  let sseEverOpened = false;
-  let sseErrStreak = 0;
-  let sseRetryAt = 0;          // 关闭后最早的(重)建时刻
-  const sseMap = new Map();    // sessionId -> summary（计数源；与 /_manager/sessions 同构）
+  let sseAlive = false; // 仅有效 snapshot 后 live，open 不是摘要有效性证据
+  let sseGeneration = 0;
+  let sseRetryAt = 0;
+  let sseSnapshotTimer = null;
+  let dataRevision = 0; // 新帧/失联前发出的旧 HTTP 响应不得覆盖当前数据
+  let sessionsKnown = false;
+  const sseMap = new Map(); // 最近有效摘要（SSE / HTTP 同构），未知时不参与完成判定
 
   function sseCounts() {
     let working = 0;
@@ -658,84 +687,91 @@
     if (syncTimer) return;
     syncTimer = setTimeout(() => {
       syncTimer = null;
-      if (!contextAlive()) return;
+      if (pageStopped || !contextAlive() || !sessionsKnown) return;
       const items = [...sseMap.values()];
       chrome.runtime.sendMessage({ type: 'sessions-sync', items }).catch(() => { /* SW 休眠竞态：静默 */ });
     }, 100);
   }
 
+  function publishSessions() {
+    sessionsKnown = true;
+    dataRevision += 1;
+    syncSessionsToSW(); // HTTP 回退亦刷新现有 sessions-sync mirror，字段不变
+    document.documentElement.setAttribute('data-dshm-sse-count', String(sseMap.size));
+    if (document.hidden) attApply(sseCounts());
+    else attReset();
+  }
+
   function applySseFrame(frame) {
-    if (!frame || typeof frame !== 'object' || typeof frame.event !== 'string') return;
+    if (pageStopped || !contextAlive() || !frame || typeof frame !== 'object') return false;
     if (frame.event === 'snapshot') {
-      const items = frame.data && Array.isArray(frame.data.items) ? frame.data.items : [];
+      if (!validSnapshot(frame.data)) return false;
       sseMap.clear();
-      for (const it of items) if (it && typeof it.sessionId === 'string') sseMap.set(it.sessionId, it);
+      for (const item of frame.data.items) sseMap.set(item.sessionId, item);
+      sseAlive = true;
+      if (sseSnapshotTimer) { clearTimeout(sseSnapshotTimer); sseSnapshotTimer = null; }
+      document.documentElement.setAttribute('data-dshm-sse-alive', '1');
     } else if (frame.event === 'upsert') {
-      const s = frame.data && frame.data.session;
-      if (s && typeof s.sessionId === 'string') sseMap.set(s.sessionId, s);
+      if (!sseAlive || !validSummary(frame.data && frame.data.session)) return false;
+      const item = frame.data.session;
+      sseMap.set(item.sessionId, item);
     } else if (frame.event === 'removed') {
       const id = frame.data && frame.data.sessionId;
-      if (typeof id === 'string') sseMap.delete(id);
-    } else {
-      return;
-    }
-    syncSessionsToSW(); // 镜像桥与可见性无关：popup 需要时总有最新摘要
-    // 验证诊断探针（verify-cdp 8d 段读取）：真实帧解析进入 sseMap 的证据（size 兜底
-    // 防解析丢帧——M12.2 破案复盘：只测挂钩时「帧永不进入 sseMap」的接收层缺陷
-    // 不会被发现；此探针让真实帧到达可被断言）
-    document.documentElement.setAttribute('data-dshm-sse-count', String(sseMap.size));
-    if (document.hidden) attApply(sseCounts()); // 可见时由 attTick 的 clear 逻辑接管
+      if (!sseAlive || typeof id !== 'string' || !id) return false;
+      sseMap.delete(id);
+    } else { return false; }
+    publishSessions();
+    return true;
+  }
+
+  function sessionsUnavailable() {
+    dataRevision += 1;
+    sessionsKnown = false;
+    sseMap.clear();
+    if (syncTimer) { clearTimeout(syncTimer); syncTimer = null; }
+    document.documentElement.setAttribute('data-dshm-sse-count', '0');
+    attReset(); // 只 clear 本 tab；不发送空 snapshot，更不能把未知当完成
+  }
+
+  function closeSse() {
+    sseGeneration += 1;
+    const previous = sse;
+    sse = null;
+    sseAlive = false;
+    if (sseSnapshotTimer) { clearTimeout(sseSnapshotTimer); sseSnapshotTimer = null; }
+    document.documentElement.setAttribute('data-dshm-sse-alive', '0');
+    try { if (previous && typeof previous.close === 'function') previous.close(); } catch (_) { /* 已关闭 */ }
+  }
+
+  function failSse() {
+    closeSse();
+    sseRetryAt = Date.now() + SSE_RETRY_GAP_MS;
+    sessionsUnavailable();
   }
 
   function startSse() {
-    if (sse || !contextAlive()) return;
-    if (Date.now() < sseRetryAt) return; // 失败后节流：等待下一次可见 tick 或宽限期过后再试
+    if (pageStopped || sse || !contextAlive() || Date.now() < sseRetryAt) return;
     let instance;
-    try {
-      instance = new EventSource(SSE_ENDPOINT);
-    } catch (_) {
-      return;
-    }
+    try { instance = new EventSource(SSE_ENDPOINT); }
+    catch (_) { failSse(); return; }
     sse = instance;
-    // 每实例引用守卫：断连/重连留下的迟到事件（旧实例的 onerror/onopen）只允许
-    // 影响其自身实例——`sse !== instance` 时状态归属已更换（如测试挂钩接管），
-    // 不得复位/置位当前连接状态。
-    instance.onopen = () => {
-      if (sse !== instance) return;
-      sseAlive = true;
-      sseEverOpened = true;
-      sseErrStreak = 0;
-      // 验证诊断探针（verify-cdp 8d 段读取；DOM 属性零业务副作用，与挂钩同款）：
-      // 真实 EventSource 连接建立的唯一证据（M12.2 破案复盘：verify 曾只测挂钩、
-      // 绕过真实连接——此探针让真实路径可被断言）
-      document.documentElement.setAttribute('data-dshm-sse-alive', '1');
-    };
-    // 帧接收（2026-08-26 修复）：插件 SSE 帧全部带 `event:` 头（snapshot/upsert/
-    // removed），按 EventSource 规范它们派发为「命名事件」，永远不会触发 onmessage
-    // （onmessage 只收无 event: 头的默认 message 事件）——只挂 onmessage 会导致
-    // applySseFrame 从未执行、sseMap 恒空、徽标全链路失效（用户实机：蓝 n/黄? 都不亮）。
-    // 真实帧的 e.data 是裸对象（snapshot→{ok,items}、upsert→{session}、removed→
-    // {sessionId}），统一包成 applySseFrame 期望的 {event, data} 形状。
-    const onSseEvent = (name) => (e) => {
+    const generation = ++sseGeneration;
+    const isCurrent = () => !pageStopped && contextAlive() && sse === instance && sseGeneration === generation;
+    sseSnapshotTimer = setTimeout(() => { if (isCurrent() && !sseAlive) failSse(); }, SSE_SNAPSHOT_TIMEOUT_MS);
+    // open 不赋予 live；只有同代次的有效 snapshot 才可信。
+    instance.onopen = () => { if (!isCurrent()) return; };
+    // 插件带 event: 头，必须监听命名帧；每一个回调（不只 open/error）均绑定代次。
+    const onSseEvent = (name) => (event) => {
+      if (!isCurrent()) return;
       let payload;
-      try { payload = JSON.parse(e && e.data); } catch (_) { return; }
+      try { payload = JSON.parse(event && event.data); } catch (_) { return; }
       applySseFrame({ event: name, data: payload });
     };
     instance.addEventListener('snapshot', onSseEvent('snapshot'));
     instance.addEventListener('upsert', onSseEvent('upsert'));
     instance.addEventListener('removed', onSseEvent('removed'));
-    instance.onmessage = onSseEvent('message'); // 兜底：无 event: 头的默认帧（当前插件不发，防御未来）
-    instance.onerror = () => {
-      if (sse !== instance) return;
-      // 未连上（插件未装/旧版）或反复失败：关闭并回退轮询路径（attTick 恢复 1Hz 端点快取）
-      sseErrStreak += 1;
-      if (!sseEverOpened || sseErrStreak >= SSE_ERR_LIMIT) {
-        try { instance.close(); } catch (_) { /* 忽略 */ }
-        sse = null;
-        sseAlive = false;
-        sseRetryAt = Date.now() + SSE_RETRY_GAP_MS;
-      }
-    };
+    instance.onmessage = onSseEvent('message');
+    instance.onerror = () => { if (isCurrent()) failSse(); };
   }
 
   // verify-cdp 合成帧注入挂钩：事件处理路径与真实 EventSource 完全一致。
@@ -748,52 +784,45 @@
   // startSse 的实例守卫隔离。验证期在 documentElement 写探针属性供 CDP 读取。
   document.addEventListener('__whalekeeper_sse_frame', (e) => {
     const detail = e && e.detail;
-    if (detail && typeof detail === 'object' && detail.__whalekeeper === true) {
-      sseAlive = true;
-      if (!sse) sse = { simulated: true }; // 占位：可见分支不再重连、onerror 无从触发
-      document.documentElement.setAttribute('data-dshm-sse-alive', '1'); // verify 诊断探针
-      applySseFrame(detail.frame);
+    if (pageStopped || !contextAlive() || !detail || detail.__whalekeeper !== true) return;
+    const frame = detail.frame;
+    if (frame && frame.event === 'snapshot' && validSnapshot(frame.data)) {
+      closeSse(); // 模拟代次替换真实流，隔离旧 callbacks / HTTP 响应
+      sse = { simulated: true };
+      applySseFrame(frame);
+    } else if (sse && sse.simulated) {
+      applySseFrame(frame);
     }
   }, true);
 
   async function attTick() {
+    if (pageStopped) return;
     if (!contextAlive()) { attStop(); return; }
-    const now = Date.now();
-    if (!document.hidden) {
-      // 页面可见：清除提醒（用户正在看），并复位状态机基线（无需端点数据）；
-      // 顺带尝试（重）建 SSE（插件恢复/实例重启后自愈）
-      if (attActive) { attActive = false; attSend('clear'); }
-      attPhase = 'idle';
-      attIdleSince = 0;
-      attLastSig = '';
-      if (!sse) startSse();
-      return;
-    }
-    // M12：SSE 存活时事件驱动——可见期到达的帧只记账（attApply 按 M8 设计在可见时
-    // 跳过：用户在看，无需上报）；切到后台后必须由本 tick 用当前内存计数补推一次
-    // 状态机——否则「先发帧、后切后台」的真实时序（计划待审期间切标签看徽标）会
-    // 永远错过上报（2026-08-26 用户实测：popup 已见「待确认」、徽标不黄）。
+    if (!document.hidden) attReset();
+    startSse(); // visible / hidden 都重试，不依赖切回标签
     if (sseAlive) {
-      attApply(sseCounts()); // 纯内存推进，0 网络
+      if (document.hidden) attApply(sseCounts()); // 纯内存推进，0 HTTP
       return;
     }
-    if (attBusy) return; // 上一 tick 的端点快取未返回：跳过（hidden 1Hz 下仅偶发）
+    if (attBusy) return;
+    const revision = dataRevision;
+    const generation = sseGeneration;
     attBusy = true;
-    let s;
-    try {
-      s = await attSnapshot();
-    } catch (_) {
-      s = null; // 极端分支兜底（attSnapshot 内部已自吸收，此处双保险）
-    } finally {
-      attBusy = false;
-    }
-    if (!s) s = { working: 0, waiting: 0 };
-    if (!document.hidden) return; // 快取期间转可见：交给可见分支（下一次 tick 清 clear）
-    attApply(s);
+    let snapshot;
+    try { snapshot = await attSnapshot(); }
+    finally { attBusy = false; }
+    // 新 SSE 帧或连接代次已改变，迟到 HTTP 成功/失败都不能改新快照。
+    if (pageStopped || !contextAlive() || sseAlive || revision !== dataRevision || generation !== sseGeneration) return;
+    if (!snapshot) { sessionsUnavailable(); return; }
+    sseMap.clear();
+    for (const item of snapshot.items) sseMap.set(item.sessionId, item);
+    publishSessions();
   }
 
   function attStop() {
     if (attTimer) { clearInterval(attTimer); attTimer = null; }
+    closeSse();
+    sessionsUnavailable();
   }
 
   refresh();
@@ -804,6 +833,19 @@
   startSse(); // M12：同源 SSE 订阅（端点不可用/插件未装时 onerror 自动回退）
   // M2：同标签导航离开 dsh（tab 不关闭）时主动清除提醒；SW 侧 tabs.onUpdated 同规则兜底
   window.addEventListener('pagehide', () => {
-    if (attActive) { attActive = false; attSend('clear'); }
+    pageStopped = true;
+    stopPoll();
+    attStop();
+    themeObserver.disconnect();
+  });
+  // BFCache 恢复仍可使用原面板，但不得沿用离页前的流和完成基线。
+  window.addEventListener('pageshow', () => {
+    if (!pageStopped || !contextAlive()) return;
+    pageStopped = false;
+    themeObserver.observe(document.body, { attributes: true, attributeFilter: ['data-ds-dark-theme'] });
+    syncThemeMirror();
+    if (!document.hidden) startPoll();
+    attTimer = setInterval(attTick, ATTENTION_TICK_MS);
+    attTick();
   });
 })();

@@ -5,19 +5,23 @@ import os from 'node:os'
 import path from 'node:path'
 import { publishReadiness } from '../readiness.js'
 
+const pluginVersion = JSON.parse(fs.readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version
+
 function fixture(t, loader) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-ready-'))
   const file = path.join(dir, 'ready.json')
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
   const env = { DSH_MANAGER_READY_FILE: file, DSH_MANAGER_LAUNCH_ID: 'a'.repeat(32),
     DSH_MANAGER_LAUNCH_STARTED_AT: String(Date.now()) }
-  const ctx = { webServer: { port: 31930 }, get: () => loader }
+  const effects = []
+  const ctx = { webServer: { port: 31930 }, get: () => loader,
+    effect(callback) { const dispose = callback(); effects.push(dispose); return dispose } }
   const start = () => {
     const dispose = publishReadiness(ctx, env)
     t.after(dispose)
     return dispose
   }
-  return { ctx, env, file, start, read: () => JSON.parse(fs.readFileSync(file, 'utf8')) }
+  return { ctx, env, file, start, effects, read: () => JSON.parse(fs.readFileSync(file, 'utf8')) }
 }
 
 test('readiness waits for Loader, reports actual process/port, and cleans up', async (t) => {
@@ -34,7 +38,7 @@ test('readiness waits for Loader, reports actual process/port, and cleans up', a
   assert.equal(signal.launchId, f.env.DSH_MANAGER_LAUNCH_ID)
   assert.equal(signal.launchStartedAt, Number(f.env.DSH_MANAGER_LAUNCH_STARTED_AT))
   assert.equal(signal.schemaVersion, 1)
-  assert.equal(signal.pluginVersion, '0.4.1')
+  assert.equal(signal.pluginVersion, pluginVersion)
   assert.equal(JSON.stringify(signal).includes('token'), false)
   dispose()
   assert.equal(fs.existsSync(f.file), false)
@@ -125,6 +129,63 @@ test('write failure is nonfatal', async (t) => {
   await new Promise(setImmediate)
   assert.doesNotThrow(dispose)
   assert.deepEqual(fs.readdirSync(path.dirname(f.file)), ['ready.json'])
+})
+
+test('readiness registers effect ownership before publishing or creating a timer', (t) => {
+  const f = fixture(t)
+  f.ctx.effect = () => { throw new Error('effect unavailable') }
+  let created = 0
+  t.mock.method(globalThis, 'setInterval', () => { created += 1; return { unref() {} } })
+  assert.throws(f.start, /effect unavailable/)
+  assert.equal(fs.existsSync(f.file), false)
+  assert.equal(created, 0)
+})
+
+test('readiness cleanup survives cancellation failure and is idempotent', async (t) => {
+  const f = fixture(t)
+  let cancellations = 0
+  let timer
+  let cleared = 0
+  t.mock.method(globalThis, 'setInterval', callback => { timer = { callback, unref() {} }; return timer })
+  t.mock.method(globalThis, 'clearInterval', handle => { assert.equal(handle, timer); cleared += 1 })
+  f.ctx.get = () => ({ onReady() { return () => { cancellations += 1; throw new Error('cancel failed') } } })
+  const dispose = f.start()
+  assert.doesNotThrow(dispose)
+  assert.equal(fs.existsSync(f.file), false)
+  assert.equal(cleared, 1)
+  dispose()
+  for (const cleanup of f.effects) await cleanup()
+  assert.equal(cancellations, 1)
+  assert.equal(cleared, 1)
+  timer.callback()
+  assert.equal(fs.existsSync(f.file), false)
+})
+
+test('readiness setup failure rolls back starting publication and lease timer', (t) => {
+  const f = fixture(t)
+  let active = false
+  t.mock.method(globalThis, 'setInterval', () => { active = true; return { unref() {} } })
+  t.mock.method(globalThis, 'clearInterval', () => { active = false })
+  f.ctx.get = () => ({ onReady() { throw new Error('subscribe failed') } })
+  assert.throws(f.start, /subscribe failed/)
+  assert.equal(active, false)
+  assert.equal(fs.existsSync(f.file), false)
+})
+
+test('older mount cleanup failure cannot delete a newer ready publication', async (t) => {
+  const f = fixture(t)
+  f.ctx.get = () => ({ onReady(markReady) {
+    markReady()
+    return () => { throw new Error('cancel failed') }
+  } })
+  const first = f.start()
+  const second = f.start()
+  const newer = f.read()
+  assert.equal(newer.state, 'ready')
+  assert.doesNotThrow(first)
+  assert.equal(f.read().mountId, newer.mountId)
+  second()
+  assert.equal(fs.existsSync(f.file), false)
 })
 
 test('lease refreshes while mounted and stops after dispose', async (t) => {

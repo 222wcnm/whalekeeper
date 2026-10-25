@@ -8,7 +8,7 @@
 
 ### 9.1 一键启动（核心体验）
 
-> **本节为早期草稿，与 §6.3 实现有出入；以 §6.3 为准**：宿主的 start **在宿主侧轮询至就绪（≤30s）后才应答** `running`（`--port 0` 时先做 ≤30s 端口发现再探活），并非「spawn 即返回 starting」；SW 以 start 60s / restart 120s 兜底超时等待完整应答；popup 应用应答结果后以 **2s** 轮询 status 收敛（`starting` 只在应答前由 popup 乐观反馈展示）。
+> **本节示意以 §6.3 当前契约为准**：宿主 start 先等待就绪再应答 `running`（或错误），并非 spawn 即返回 starting。端口发现与就绪从 spawn 起共享 150s，URL 捕获额外最多 5s；SW start 210s / restart 240s 等待完整应答。Popup 应答前乐观展示 starting，随后 2s 轮询收敛。
 
 ```
 Popup                     Background SW                Native Host                 dsh
@@ -19,7 +19,7 @@ Popup                     Background SW                Native Host              
   │                          │                            ├─ 抢锁/解析/校验         │
   │                          │                            ├─spawn(detached)────────▶│ 开始加载
   │                          │                            │   写 run 记录 + 日志    │
-  │                          │                            ├─ 轮询探活（≤30s；       │
+  │                          │                            ├─ 共享就绪（≤150s；      │
   │                          │                            │   --port 0 先发现端口） │
   │                          │◀─ {ok, state:"running"} ────┤◀─ GET / 200 ───────────┤
   │◀─sendResponse(running)───│                            │                        │
@@ -163,18 +163,26 @@ dsh-manager/
 
 ### 12.2 遵守 dsh 自身的安全模型
 
+**2026-10-18 修复补充（优先于下列旧 DOM 回退描述）**：无可靠摘要时不扫描全页
+StateDot 推导精确状态；仅实例管理可用。Popup 可用内部消息询问 content script 的同源
+首页认证状态（HTTP 响应码与有效端口），不读响应正文、消息、cookie 或凭据，不传 token。
+认证状态未知时有合法启动 URL 则新开页面，不改原标签；不能把标签存在当成已认证。
+实际请求预算按 §6.3，150 秒未就绪才报 START_TIMEOUT，不再沿用历史 30 秒文案。
+
+### 12.2.1 既有围栏
+
 - 不调用 `/api`（Origin 围栏，F9）；探活只用 `GET /`。
 - 生命周期插件端点（§7）必须自我设限：仅回环连接 + Origin 缺失或同源，**绝不注册为公开 RPC**；「扩展 → 宿主 → HTTP」链路因宿主请求无 Origin 而天然合规，扩展直连则被拒。
 - 扩展 host_permissions 仅回环；不申请任何超出需求的权限。
-- **页面内面板（§8.6）**：content script 只注入 dsh 指纹页面（127.0.0.1/localhost 任意端口）；面板对页面的唯一写操作是追加自身 shadow 节点，不读取/修改页面 DOM 与数据；停止/重启经 SW → 宿主全套防护（PID 校验、外部实例保护、锁），面板不持有任何特权 API（无 `/_lifecycle` 直连、无宿主角色的独立判定）。**例外（M8，§8.9；2026-08-24 扩为端点摘要；2026-08-26 M12 扩为 SSE 事件流）**：徽标提醒段优先**同源只读** `GET /_manager/sessions`（§8.10 摘要元数据：sessionId/标题/四态/时间戳，**不读消息体/事件内容/凭据**；仅同源回环请求）；M12 起同级**同源只读** `GET /_manager/events`（SSE，§8.10.1：snapshot/upsert/removed 帧**仅携带与 `/_manager/sessions` 完全同构的摘要元数据**，无任何消息内容/文本）为优先数据源、端点快照为其回退；端点不可用时回退只读存在性扫描（`svg[data-state="ongoing"]` / `[data-state="warning"]` 两个语义属性是否存在），不采集消息文本/会话内容；上报 SW 仅为两值枚举 `done|waiting` + 计数（M12 起增加 `sessions-sync` 摘要 items 镜像——仍为 §8.10 同构摘要，扩展内部 storage 中转，popup 侧经 `storage.onChanged` 消费；popup/SW 直连端点仍被 Origin 围栏拒绝，不构成例外扩大）。
+- **页面内面板（§8.6）**：content script 只注入 dsh 指纹页面（127.0.0.1/localhost 任意端口）；面板对页面的唯一写操作是追加自身 shadow 节点，不读取/修改页面 DOM 与数据；停止/重启经 SW → 宿主全套防护（PID 校验、外部实例保护、锁），面板不持有任何特权 API（无 `/_lifecycle` 直连、无宿主角色的独立判定）。**例外（M8，§8.9；2026-08-24 扩为端点摘要；2026-08-26 M12 扩为 SSE 事件流）**：徽标提醒段优先**同源只读** `GET /_manager/sessions`（§8.10 摘要元数据：sessionId/标题/四态/时间戳，**不读消息体/事件内容/凭据**；仅同源回环请求）；M12 起同级**同源只读** `GET /_manager/events`（SSE，§8.10.1：snapshot/upsert/removed 帧**仅携带与 `/_manager/sessions` 完全同构的摘要元数据**，无任何消息内容/文本）为优先数据源、端点快照为其回退；端点不可用时不采集页面图标猜测会话状态，只保留实例管理；上报 SW 仅为两值枚举 `done|waiting` + 计数（M12 起增加 `sessions-sync` 摘要 items 镜像——仍为 §8.10 同构摘要，扩展内部 storage 中转，popup 侧经 `storage.onChanged` 消费；popup/SW 直连端点仍被 Origin 围栏拒绝，不构成例外扩大）。
 
 ### 12.3 数据与凭据
 
 - 扩展不读取、不存储 `$DSH_HOME` 下的凭据文件（`.credentials.yaml`）；状态展示仅含 pid/端口/时长/版本/健康字段。
 - run 记录与日志落在 `%LOCALAPPDATA%`，仅本用户可读；日志中可能出现工作区路径，属于本机用户自身信息。
-- **M9 会话元数据边界（2026-08-23）**：`/_manager/sessions` 端点只出**只读摘要元数据**（sessionId/title/state/updatedAt/blank/cwd）——title 取自 `session/title` 事件（已归一化），state 由事件流判定（`approval/asked`↔`decided`、`tool/call`(ask_user_question)↔`tool/result` 配对）；**不读消息体/事件内容/凭据**；扩展侧渲染仅用摘要，行点击只打开 Web UI 首页。§12.2 的「不调用 /api、不读页面内容」范围不变。
+- **M9 会话元数据边界（2026-08-23）**：`/_manager/sessions` 端点只出**只读摘要元数据**（sessionId/title/state/updatedAt/blank/cwd）——title 取自 `session/title` 事件（已归一化），state 由事件流判定（`approval/asked`↔`decided`、`tool/call`(ask_user_question)↔`tool/result` 配对）；**不读消息体/事件内容/凭据**；扩展侧渲染仅用摘要，会话行只读，无伪深链，统一入口打开 Web UI。§12.2 的「不调用 /api、不读页面内容」范围不变。
 - **M12 推送边界（2026-08-26）**：`/_manager/events`（SSE）帧与 `/_manager/sessions` 完全同构（同上摘要字段，无消息内容/文本）；popup 镜像桥（`storage.local.sessionsCache`）只存该摘要 items（≤50 条/端口），**不存储/转发事件正文、工具结果、附件、凭据**；插件侧事件订阅仅用于派生摘要状态（`summarizeSession` 同款判定），任何事件内容都不进入推送/存储面。
-- **M13 launchUrl/token 边界（2026-09-04）**：dsh ≥ 0.1.2 起 `GET /` 受启动令牌认证（§2.1.1 B1），扩展「打开 Web UI」需携带 `?token=` 才能免 401。宿主在 start 日志扫描时捕获完整启动 URL（`dsh web: <url>`，含进程级一次性 token）写入 run 记录 `launchUrl` 字段——**仅限本机存储**（`%LOCALAPPDATA%`，与 dsh 日志同信任域：token 本就被 dsh 打印进日志文件），**仅经 native 通道返回扩展 SW 用于 `chrome.tabs.create`**；**不写入 storage.local、不显示在 popup/logs UI 文本、不进入任何网络请求、不随 adopt/重放跨实例复制**（adopted 记录无 launchUrl）。浏览器标签地址栏可见 token 属预期（本机浏览器访问本机 dsh）。
+- **M13 launchUrl/token 边界（2026-09-04，2026-10-18 澄清）**：dsh ≥ 0.1.2 的首页需 token/cookie。宿主从本次启动日志捕获完整启动 URL，存本用户 run 记录，经 native 临时返回 Popup 用于导航；不写 storage，不显示到 UI，不进入摘要/SSE/认证状态查询，不随 adopt 跨实例复制。导航前校验 HTTP 回环、实际端口、根路径和无用户密码。token 只在浏览器导航认证请求中使用（不能误写为“不进入任何网络请求”）；raw dsh 启动日志与 run 记录属于其原有本机信任域，宿主诊断日志、测试报告和控制台输出须脱敏。
 
 ---
 
@@ -184,7 +192,7 @@ dsh-manager/
 |------|------|
 | dsh 未安装 / npm 全局路径变化 | `DSH_NOT_FOUND`，popup 给出安装命令；ping 可诊断路径解析链 |
 | 端口被其他程序占用 | `PORT_BUSY`，建议换端口（设置面板） |
-| 启动 30s 未就绪 | `START_TIMEOUT` + 日志尾部；进程保留，用户可看日志决定 |
+| 从 spawn 起 150s 未就绪 | `START_TIMEOUT` + 脱敏日志尾部及阶段/耗时；进程保留，用户可看日志决定 |
 | 旧版本 dsh（缺 `--port` 等） | start 前 `dsh --version` 校验最低版本（v1 定为 0.1.0-rc.x 基线） |
 | run 记录指向已死 PID（上次崩溃残留） | status 自动清理；stop 幂等 |
 | 快速连点启动 ×N | 锁 + `ALREADY_RUNNING` 幂等 |
@@ -208,6 +216,11 @@ dsh-manager/
 ## 14. 测试计划
 
 ### 14.1 宿主冒烟（不依赖浏览器）
+
+**2026-10-19 rc.2 增量实测**：33 场景 Windows **428 PASS / 0 FAIL / 1 POSIX SKIP**；
+插件 87、宿主 29、扩展 62 共 **178/178 单测**，0 SKIP。新回归覆盖共享 150s
+截止、STDIO 在途跨 15s、health 重试、迟关端口、lease 所有权与清理、真实 Cordis
+重挂与 SSE 一致性、扩展退避及安全入口；下面的 27/21 等数字是历史基线。
 
 `test/smoke.js`（27 场景，2026-08-15 计数：Windows 347 PASS + 1 SKIP / Linux 337 PASS + 1 SKIP——场景 26 POSIX 专属、场景 27 载体为 Windows 专属）：以 `--req/--res` 文件模式逐请求
 拉起 `node host.js`（沙箱管道受限环境兼容），伪 dsh 由 `DSH_BIN_STUB` 指向
@@ -245,7 +258,10 @@ M7 状态卡断言、M8 徽标提醒分层渲染（done/waiting/清空恢复）�
 9. （M2）安装 dsh-lifecycle 后：stop 走优雅路径（无 taskkill 调用、会话无损）；health 返回 200 且字段正确；卸载插件后回归 M1 路径无退化。
 10. （M3）打开任意 dsh Web UI 页面 → 右下角出现页面内管理面板（§8.6）：状态徽章随 status 轮询更新；展开后「停止」两步确认、「重启」走宿主语义；非 dsh 的本地页面不注入。verify-cdp.js 已自动覆盖「注入 + 渲染 + 状态文本 + 展开 + 两步确认态（首击确认/3s 还原）」。
 
-### 14.3 验收标准（MVP）
+### 14.3 验收标准（MVP 历史体验目标）
+
+本节 ≤15s 和 20 次属于早期体验/耐久目标，不代表 rc.2 已实测或硬超时；本轮正式门槛
+为 §2.1.3 的三轮固定/动态端口与至少一次真实浏览器恢复，就绪实际预算按 §6.3。
 
 - 安装 ≤ 2 分钟（跑一个脚本 + 浏览器加载目录）。
 - Start 点击到 Web UI 打开 ≤ 15s（含 dsh 冷启动）。

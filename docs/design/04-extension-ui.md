@@ -39,6 +39,15 @@
 
 ### 8.2 popup（popup.html/js/css，V6 侧边 Rail 导轨空间架构）
 
+**rc.2 导航与等待契约（2026-10-18）**：会话行只读，不生成未获上游支持的
+`/#/chat/{id}`；已读/撤销及统一 Web UI 入口保留。标签复用以 URL 解析后的 HTTP、
+127.0.0.1/localhost 与有效端口精确比较（省略端口为 80，3080 不匹配 30801）。
+新增 Popup→content script 只读认证查询，只返回认证状态和有效端口；查询不读取
+消息/凭据，令牌不进入消息。确认已认证仅聚焦；401/休眠/无法确认且有合法启动 URL
+时另开认证页，不覆盖原标签和草稿。启动 URL 必须为 HTTP 回环、实际端口、根路径，
+无用户名密码；external/adopted 无令牌时裸 URL 降级并提示使用原启动入口。
+SW 动作预算 start/restart/stop=210/240/60 秒；错误文案不写死 30 秒，不虚构重启阶段。
+
 **空间架构与尺寸基线：380px 宽度 × 270px 严格物理锁定高度（零抖动）。** 采用 Master-Detail 侧边导轨架构（左侧 **46px 极窄 Rail 导轨** + 右侧 **334px 独立视口**），尺寸从 360×240px 舒展放大至 380×270px，不仅彻底根除传统单列视图在面板展开、设置切换时的尺寸拉长与跳动问题，还为多会话列表与运维操作提供了从容呼吸的视觉空间。
 
 **视觉规范：100% 对齐 dsh Web UI 设计系统与原厂原生资产。**
@@ -119,11 +128,11 @@ popup「查看日志」打开的全页日志查看器，视觉延续同一套 `-
 职责与约束：
 
 1. **串行化 native 调用**：维护单一 `pending` promise 队列，一次只允许一个 connectNative 连接；并发请求排队（状态模型本身幂等，但串行化可消除锁竞争与 Chrome 多宿主进程）。
-2. 单次 native 往返时长按动作区分：**start/restart 的「轮询到就绪」在宿主侧完成**（start ≤30s 端口轮询 + M4 `--port 0` 的 30s 端口发现；restart = stop≤10s + start≤30s 串行），SW 以更长的兜底超时等待应答（start 60s / restart 120s，§8.3.6）——start 返回的就是 `running`（或超时错误），popup 应用结果后由 2s 轮询收敛（与 §6.3 实现一致；§9 时序为早期草稿，若与本节冲突以本节与 §6.3 为准）。
+2. 单次 native 往返时长按动作区分：**start/restart 的「轮询到就绪」在宿主侧完成**（三种模式从 spawn 起 150s 共享发现/就绪截止，URL 捕获最多额外 5s；restart 先 stop 再 start）。SW 以 start 210s / restart 240s 等待；返回 `running` 或超时错误，popup 应用结果后由 2s 轮询收敛。
 3. 连接异常处理：`connectNative` 抛 `Specified native messaging host not found` → 向 popup 返回 `HOST_NOT_INSTALLED`，引导运行安装器。
 4. 徽标刷新：`chrome.alarms`（30s）→ 本地 fetch 探活（不惊动宿主）→ 更新 **图标角标**（`action.setIcon`，绿点=运行/红点=错误/无点=停止，M8.1）+ title；徽标字符专职会话状态层（§8.9）。**M4：settings.port === 0（动态端口）时本地探活不可行，改经 native `status` 判定**（宿主解析实际端口）。
 5. 全部 native 消息走 `chrome.runtime.sendMessage` 的 async 应答（`return true` + `sendResponse`）。
-6. **兜底超时按动作区分（M1.3）**：restart 120s（宿主内 stop≤10s + start≤30s 串行执行）、start 60s、stop/adopt 45s、其余 30s——避免长操作被 30s 兜底误判为「宿主无响应」而返回 `NATIVE_ERROR`（错误信息内附实际秒数）。
+6. **兜底超时按动作区分（rc.2）**：restart 240s、start 210s、stop 60s、adopt 45s、sessions 8s、其余 30s；仅在该动作在途时持有 native 连接，处理完断开，不引入常驻保活。
 
 ### 8.5 宿主 manifest 与注册（§10 安装器生成）
 
@@ -312,13 +321,13 @@ popup 设置面板新增「外观」行（四个互斥选项按钮），复刻 W
 
 **触发信号（webui 事实基线，取自 `@deepseek-ai/dsh-client-ui-workspace` 0.1.1-rc.2 客户端包与 `dsh-web-frontend` bundle）**：会话侧栏行由 `StateDot` 渲染——**工作中** = `svg[data-state="ongoing"]`（基线为 10×10 点阵追逐动画；2026-08-22 用户实测当前版本渲染为**蓝色状态标签**（如「Deep diving…」，`--dsh-state-ongoing: --dsw-static-deepseek-450` #5686fe）；徽标蓝 n 与 webui 同源）；**等待用户**（pendingInteraction: approval / question / plan-review）= `span[data-state="warning"]`；空闲/完成 = `data-state="done"`。这组 `data-state` 值是 StateDot 的**语义 API 属性**（非 CSS-module 哈希类名），跨 webui 版本漂移风险低。
 
-> **数据源修订（2026-08-24，徽标←→popup 会话区计数一致性）**：`data-state` 是 webui **显示态**，相对服务端事件流存在前端渲染延迟——会话完成/空闲瞬间扫描会拿到旧计数，且同实例多标签各自上报会被重复累加，产生「徽标蓝 2、popup 会话区进行中 1」的偶发不一致（2026-08-23 用户实机反馈）。**计数改为优先读服务端点** `GET /_manager/sessions`（§8.10，与 popup「会话」区同一端点、同一状态判定），`data-state` DOM 扫描仅作**回退**（插件未装/旧版/端点失败；此时 popup 会话区为降级/隐藏路径，无数字不一致的用户可见面）。同实例多标签的重复计数由 SW 聚合去重（见下第 3 条）。
+> **数据源修订（2026-08-24，徽标←→popup 会话区计数一致性）**：`data-state` 是 webui **显示态**，相对服务端事件流存在前端渲染延迟——会话完成/空闲瞬间扫描会拿到旧计数，且同实例多标签各自上报会被重复累加，产生「徽标蓝 2、popup 会话区进行中 1」的偶发不一致（2026-08-23 用户实机反馈）。**计数改为优先读服务端点** `GET /_manager/sessions`（§8.10，与 popup「会话」区同一端点、同一状态判定），历史曾用 `data-state` 回退；rc.2 起删除该路径，插件摘要不可用就降为仅实例管理。同实例多标签的重复计数由 SW 聚合去重（见下第 3 条）。
 >
-> **数据源再修订（2026-08-26，M12 会话推送）**：M12 起徽标计数**改为 SSE 事件流优先**——面板经同源 `EventSource('/_manager/events')` 订阅（§8.10），事件到达即刷新计数并经既有 `attention` 上报（延迟从 ≤1s+30s 降为 <100ms），**SSE 存活期间不再 1Hz 打端点**；端点 `1Hz` 轮询与 DOM 扫描降为**降级回退**（SSE 连接失败/插件缺失时，行为与当前完全一致）。「计数与 popup 会话区同源」性质不变（SSE 与 `/_manager/sessions` 共享同一 `buildItems`/同一状态判定）。
+> **数据源再修订（2026-08-26，M12 会话推送）**：M12 起徽标计数**改为 SSE 事件流优先**——面板经同源 `EventSource('/_manager/events')` 订阅（§8.10），事件到达即刷新计数并经既有 `attention` 上报（延迟从 ≤1s+30s 降为 <100ms），**SSE 存活期间不再 1Hz 打端点**；端点 `1Hz` 轮询作为回退；rc.2 起无可靠摘要则仅实例管理，不再 DOM 扫描。「计数与 popup 会话区同源」性质不变（SSE 与 `/_manager/sessions` 共享同一 `buildItems`/同一状态判定）。
 
 **行为规范（`extension/content/panel.js` 检测段 + `extension/background.js` 双载体渲染）**：
 
-1. **检测（panel.js，只读；2026-08-24 数据源修订；2026-08-26 M12 再修订）**：与面板共注入（同一指纹激活）。**SSE 优先（2026-08-26 起）**：面板订阅同源 `EventSource('/_manager/events')`（§8.10 M12），事件到达即更新计数并走下述状态机/上报；**SSE 未存活时才回到「每 1s 取一次计数快照」**路径。快照路径**端点优先**：同源 `fetch('/_manager/sessions')`（1.5s 超时，失败静默；只读摘要元数据，与 §8.10 同口径，不读消息内容/文本）→ 统计 `items` 中 `state==='working'` / `state==='waiting'` 的数量；端点不可用（插件未装/旧版/网络失败）时**回退** DOM 扫描（`svg[data-state="ongoing"]`、`[data-state="warning"]` 两个选择器 `querySelectorAll().length`，只判定存在性并计数）。状态机：`idle → working →(稳定 1.2s 空态)→ done-fired`；`任意 → waiting-fired`（waiting 出现立即上报，优先级覆盖 done）。等待用户 outranks 工作进行中（用户侧语义：需要拍板 > 继续观察）。注：隐藏页定时器被 Chrome 节流至 1Hz，取 1s 周期与节流上限对齐；端点快取在途（超时最长 1.5s > 1s 周期）时跳过重叠 tick；SSE 事件驱动路径不存在该节流问题（事件即达）。
+1. **检测（panel.js，只读；2026-08-24 数据源修订；2026-08-26 M12 再修订）**：与面板共注入（同一指纹激活）。**SSE 优先（2026-08-26 起）**：面板订阅同源 `EventSource('/_manager/events')`（§8.10 M12），事件到达即更新计数并走下述状态机/上报；**SSE 未存活时才回到「每 1s 取一次计数快照」**路径。快照路径**端点优先**：同源 `fetch('/_manager/sessions')`（1.5s 超时，失败静默；只读摘要元数据，与 §8.10 同口径，不读消息内容/文本）→ 统计 `items` 中 `state==='working'` / `state==='waiting'` 的数量；端点不可用（插件未装/旧版/网络失败）时仅保留实例状态，清本标签陈旧会话信号并复位完成基线，不扫描 DOM 或将未知当成完成。状态机：`idle → working →(稳定 1.2s 空态)→ done-fired`；`任意 → waiting-fired`（waiting 出现立即上报，优先级覆盖 done）。等待用户 outranks 工作进行中（用户侧语义：需要拍板 > 继续观察）。注：隐藏页定时器被 Chrome 节流至 1Hz，取 1s 周期与节流上限对齐；端点快取在途（超时最长 1.5s > 1s 周期）时跳过重叠 tick；SSE 事件驱动路径不存在该节流问题（事件即达）。
 2. **触发即上报（页面隐藏时；计数签名变化才发）**：仅在 `document.hidden === true`（标签不活跃或窗口最小化）时上报；`set`: `{type:'attention', op:'set', kind:'idle'|'working'|'waiting'|'done', counts:{working,waiting}}` → SW；**waiting:0→working:0 的计数签名（`waiting:working`）变化即上报**（蓝 n 常驻概览的数据源），`done` 为工作→空闲稳定 1.2s 的事件上报；SW 侧 `sender.tab.id` 为事实键（多个 dsh 标签页各记各的）。**页面重新可见即发 `op:'clear'`**（防「用户已在看却仍挂提醒」）。
 3. **SW 侧（background.js）**：`attentionMap`（storage.local，`{ [tabId]: {kind, working, waiting, at, port} }`）持久化——MV3 SW 可回收，徽标状态以 storage 为事实源；`tabs.onRemoved` 清理；**同标签导航离开 dsh（tab 未关闭）由 `tabs.onUpdated` 按 URL 判定清理（M8 修补 M2，content script 侧 pagehide 亦发 clear 双保险）**；`onStartup`/`onInstalled` 清空（浏览器重启/扩展更新后的旧提醒无意义，沿用占位即可）；4 小时 TTL 防僵尸键（兜底，不影响正常使用）。**同实例多标签去重（2026-08-24 修订）**：聚合前按条目 `port` 归并——同端口只保留 `at` 最新条目（idle 无信号条目不参与同端口竞争，保持「空=安静」语义）；无端口条目（外部/旧数据兼容）按 tab 独立参与。徽标渲染优先级：**waiting（黄「?」#f59e0b，M10.1 定稿）> done（绿「!」#22c55e，M10.1 定稿——原琥珀!随「完成」定稿改绿）> working（蓝 n #5686fe，n≥10 显示「9+」）**；文字色显式 `#ffffff`。**死提醒联动（M8.1 修补）**：refreshBadge 判定实例未运行/异常时，按条目 `port`（上报时从 tab.url 解析）清除对应端口的会话信号——此前「实例已停、黄?/绿! 仍挂 4h TTL」的误导场景。title 同步：等待/完成/工作三条文案 + 服务态（角标层）title。
 4. **设置**：`settings.attention`（默认 `true`，popup 设置面板「界面」分组开关「徽标提醒（回来看看）」）——关闭后 SW 忽略 set 且清空累积条目（`handleAttention` 的 set 分支以前置判断拒绝 + storage.onChanged 在开关变 off 瞬间清空 attentionMap），否则关闭期间的条目会在重开开关时冒出一条「凭空」提醒（H1 修补；M8.1 盲审补正：清理以**本次变化的权威值**为基——单次 set 同时改 settings+attentionMap 时 onChanged 回调内 settings 分支先于 attentionMap 分支、快照条目尚未入内存，旧实现会清理扑空，且 newValue 旧快照会把已删条目恢复回内存，已加 purged 防恢复）。`settings.attentionDone`（默认 `true`，「徽标：工作完成提醒（绿!）」独立开关）——已上表的 done 事件单独可关，waiting/working 不受影响；关闭瞬间同样剔除既有 done 条目（H1 对称修补），期间 done 也不会被新写入（set 分支前置拒绝）。
